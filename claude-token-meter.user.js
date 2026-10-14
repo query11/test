@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.2.0
+// @version      1.3.0
 // @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示 token 用量与生成速度
 // @match        https://claude.ai/*
 // @run-at       document-start
@@ -60,6 +60,7 @@
       seq: 0, // 到达顺序
       messages: new Map(), // message id -> 见 messageRecord()
       results: [], // result 快照，按先后排序
+      readings: [], // 本会话收到的额度读数，用来估算额度折合多少钱
       lanes: new Map(), // 正在流式输出的请求：主对话为 'main'，子代理按 parent_tool_use_id 区分
       ctxUsage: null, // get_context_usage 的响应
       lastResp: null,
@@ -77,6 +78,7 @@
     const calib = state.calib;
     state = freshState();
     state.calib = calib;
+    quotaCache = null;
     dirty = true;
   }
 
@@ -132,9 +134,11 @@
         exact: false, // output 是否来自 message_delta 的精确值
         streamEst: 0, // 按流式增量估算的输出
         blockEst: 0, // 按 assistant 事件正文估算的输出
+        sig: 0, // 思考块签名的字符数，和看不见的思考 token 数大致成正比
         blocks: new Set(),
       };
       state.messages.set(id, m);
+      if (ctx.batch) ctx.batch.push(m);
     } else if (!m.ts && ctx.ts) m.ts = ctx.ts;
     return m;
   }
@@ -178,15 +182,24 @@
     const u = o.usage || {};
     // result 自身没有时间戳时，用“本轮开始时间 + 本轮耗时”推出结束时间
     const end = num(o.turn_started_wall_ms) && num(o.duration_ms) ? o.turn_started_wall_ms + o.duration_ms : 0;
-    state.results.push({
+    const r = {
       ...stamp(ctx, end),
       cost,
       totals: models ? totals : null,
       window,
       turnOut: num(u.output_tokens),
+      // 本轮的用量（不是累计值）
+      turn: {
+        input: num(u.input_tokens),
+        output: num(u.output_tokens),
+        cacheRead: num(u.cache_read_input_tokens),
+        cacheWrite: num(u.cache_creation_input_tokens),
+      },
       apiMs: num(o.duration_api_ms),
       wallMs: num(o.duration_ms),
-    });
+    };
+    state.results.push(r);
+    if (ctx.batch) ctx.batch.push(r);
     state.results.sort((a, b) => compare(a, b, resultWeight));
     dirty = true;
   }
@@ -225,14 +238,32 @@
     limits = JSON.parse(lsGet('ctm-limits') || '{}') || {};
   } catch {}
 
-  // 同一窗口内用量只增不减，所以不论事件先后，同一 resetsAt 取最大值；resetsAt 更晚的是新窗口
-  function recordLimits(info) {
-    if (!info || typeof info !== 'object') return;
+  function windowsOf(info) {
     const windows = { ...(info.unifiedWindows || {}) };
     // 顶层字段描述的是当前起限制作用的那个窗口（旧版 CLI 只有这一份），可能是 overage 这类不是额度窗口的类型
     if (LIMIT_NAMES[info.rateLimitType] && !windows[info.rateLimitType] && info.resetsAt) {
       windows[info.rateLimitType] = { utilization: info.utilization, resetsAt: info.resetsAt };
     }
+    return windows;
+  }
+
+  // 记下本会话看到的每个读数及其先后，估算额度折合多少钱时要和会话的花费对齐
+  function recordReadings(info, ctx) {
+    if (!info || typeof info !== 'object') return;
+    const windows = windowsOf(info);
+    for (const name in windows) {
+      const w = windows[name] || {};
+      if (!num(w.resetsAt)) continue;
+      const q = { ...stamp(ctx), name, resetsAt: num(w.resetsAt), u: num(w.utilization) };
+      state.readings.push(q);
+      if (ctx.batch) ctx.batch.push(q);
+    }
+  }
+
+  // 同一窗口内用量只增不减，所以不论事件先后，同一 resetsAt 取最大值；resetsAt 更晚的是新窗口
+  function recordLimits(info) {
+    if (!info || typeof info !== 'object') return;
+    const windows = windowsOf(info);
     let changed = false;
     for (const name in windows) {
       const w = windows[name] || {};
@@ -326,11 +357,14 @@
         const m = messageRecord(msg.id || o.uuid, ctx, o.parent_tool_use_id || 'main');
         recordUsage(m, msg.usage, false);
         for (const b of msg.content || []) {
+          if (!b) continue;
           const s = blockText(b);
-          const sig = b.id || b.type + ':' + s.length + ':' + s.slice(0, 40);
-          if (!s || m.blocks.has(sig)) continue;
-          m.blocks.add(sig);
-          m.blockEst += estimateTokens(s);
+          const signature = b.type === 'thinking' ? b.signature || '' : b.type === 'redacted_thinking' ? b.data || '' : '';
+          const key = b.id || b.type + ':' + (s.length + signature.length) + ':' + (s || signature).slice(0, 40);
+          if ((!s && !signature) || m.blocks.has(key)) continue;
+          m.blocks.add(key);
+          if (s) m.blockEst += estimateTokens(s);
+          m.sig += signature.length;
         }
         return true;
       }
@@ -339,10 +373,12 @@
         return true;
       case 'rate_limit_event':
         recordLimits(o.rate_limit_info);
+        recordReadings(o.rate_limit_info, ctx);
         return true;
       default: {
         if (o.rate_limit_info && typeof o.rate_limit_info === 'object') {
           recordLimits(o.rate_limit_info);
+          recordReadings(o.rate_limit_info, ctx);
           return true;
         }
         if (typeof o.totalTokens === 'number' && typeof o.maxTokens === 'number' && 'percentage' in o) {
@@ -407,7 +443,23 @@
   function ingestObj(obj, src) {
     const acc = { n: 0 };
     countTurns(obj, 0, acc);
-    walk(obj, { bulk: acc.n > 2, src }, 0);
+    const bulk = acc.n > 2;
+    const batch = bulk ? [] : null; // 这批历史记录里新建的记录，按出现顺序
+    walk(obj, { bulk, src, batch }, 0);
+    if (batch) fillBatchTimes(batch);
+  }
+
+  // 历史记录里有些事件自己没有时间戳（比如 rate_limit_event）。同一批数据里事件的先后是可靠的，
+  // 只是可能整体倒序，所以按位置借用前一个事件的时间戳，排在它后面
+  function fillBatchTimes(batch) {
+    const timed = batch.filter((x) => x.ts);
+    if (timed.length < 2) return;
+    const list = timed[0].ts > timed[timed.length - 1].ts ? batch.slice().reverse() : batch;
+    let last = 0;
+    for (const x of list) {
+      if (x.ts) last = x.ts;
+      else if (last) x.ts = ++last; // 连续几个没有时间戳的事件依次排开
+    }
   }
 
   function ingestLine(line, src) {
@@ -467,9 +519,10 @@
     const delta = prev && prev.totals && cur.totals ? cur.totals.output - prev.totals.output : 0;
     const tokens = cur.turnOut > 0 && delta > 0 ? Math.min(cur.turnOut, delta) : cur.turnOut || Math.max(delta, 0);
     if (!tokens) return null;
-    // duration_api_ms 是累计 API 耗时：优先取与上一条之差；本轮 API 耗时不会超过本轮总耗时
+    // duration_api_ms 是累计 API 耗时：优先取与上一条之差；本轮 API 耗时不会明显超过本轮总耗时
+    // （留 10% 余量：轮次之间的后台小请求会被算进下一轮）
     for (const ms of [prev ? cur.apiMs - prev.apiMs : 0, cur.apiMs]) {
-      if (ms > 0 && (!cur.wallMs || ms <= cur.wallMs)) return { tokens, ms, speed: tokens / (ms / 1000) };
+      if (ms > 0 && (!cur.wallMs || ms <= cur.wallMs * 1.1)) return { tokens, ms, speed: tokens / (ms / 1000) };
     }
     return { tokens, ms: 0, speed: null };
   }
@@ -485,6 +538,193 @@
     const r = state.results[state.results.length - 1];
     const max = (state.ctxUsage && state.ctxUsage.max) || (r && r.window) || 0;
     return best ? { used: best.used, max } : null;
+  }
+
+  // ---------------------------------------------------------------- 额度折合多少钱
+
+  // 思路：本会话每次请求花了多少钱是知道的；额度每涨一个百分点时会话累计花了多少，也能对上。
+  // 相邻两次跳变之间的花费 ÷ 跳过的百分点数，就是“每 1% 折合多少美元”。这假设这段时间账号没有
+  // 别处的使用，所以各段取中位数，偶尔混进别处的使用也不至于带偏。
+
+  // 各类 token 的相对价格（以输入为 1）。只用来在一轮之内分摊花费，每轮总花费以 result 为准
+  const PRICE_RATIO = { input: 1, output: 5, cacheRead: 0.05, cacheWrite: 2 };
+  const SIG_TOKENS = 0.24; // 思考签名每个字符大约对应的思考 token 数
+  const weightOf = (x, out) =>
+    x.input * PRICE_RATIO.input +
+    out * PRICE_RATIO.output +
+    x.cacheRead * PRICE_RATIO.cacheRead +
+    x.cacheWrite * PRICE_RATIO.cacheWrite;
+  // 实时事件按到达顺序排在所有历史记录之后；排不了序的历史记录不参与
+  const orderKey = (x) => (x.live ? 1e15 + x.seq : x.ts || null);
+
+  function weightedMedian(list) {
+    // list: [[值, 权重]]
+    list.sort((a, b) => a[0] - b[0]);
+    const half = list.reduce((s, x) => s + x[1], 0) / 2;
+    let acc = 0;
+    for (let i = 0; i < list.length; i++) {
+      acc += list[i][1];
+      if (acc > half) return list[i][0];
+      if (acc === half) return list[i + 1] ? (list[i][0] + list[i + 1][0]) / 2 : list[i][0];
+    }
+    return 0;
+  }
+
+  // 只看本会话：{ 窗口名: [每 1% 美元数, 依据的百分点数], sec: [模型运行秒数, 对应花费] }
+  function sessionQuotaRates() {
+    const items = [];
+    for (const m of state.messages.values()) if (orderKey(m) != null) items.push([orderKey(m), 0, m]);
+    for (const r of state.results) if (orderKey(r) != null) items.push([orderKey(r), 1, r]);
+    for (const q of state.readings) if (orderKey(q) != null) items.push([orderKey(q), 2, q]);
+    items.sort((a, b) => a[0] - b[0]);
+
+    // 第一遍：按 result 分轮，把每轮的花费按 token 权重分到各次请求上
+    const cost = new Map();
+    let pending = [];
+    let prev = null;
+    let scale = 0; // 每单位权重折合的美元，用最近一轮校准，估算还没结束的这一轮
+    let apiSec = 0;
+    let apiCost = 0;
+    for (const [, kind, x] of items) {
+      if (kind === 0) pending.push(x);
+      if (kind !== 1) continue;
+      // 本轮花费优先用相邻两条 result 的累计费用之差；和按本轮用量算的差太多（漏了 result、/clear 过）就用后者
+      const unit = x.totals ? x.cost / weightOf(x.totals, x.totals.output) : 0;
+      const byUsage = unit * weightOf(x.turn, x.turn.output);
+      let turnCost = prev && x.cost > prev.cost ? x.cost - prev.cost : 0;
+      if (byUsage && !(turnCost > byUsage / 1.5 && turnCost < byUsage * 1.5)) turnCost = byUsage;
+      // 本轮的输出数分到各次请求：有精确值的直接用，其余按正文长度和思考签名长度分
+      const rest = Math.max(0, x.turnOut - pending.reduce((s, m) => s + (m.exact ? m.output : 0), 0));
+      const share = (m) => (m.exact ? 0 : m.blockEst + SIG_TOKENS * m.sig + 1);
+      const shares = pending.reduce((s, m) => s + share(m), 0);
+      const w = pending.map((m) => weightOf(m, m.exact ? m.output : (rest * share(m)) / shares));
+      const total = w.reduce((s, v) => s + v, 0);
+      if (turnCost && total) {
+        pending.forEach((m, i) => cost.set(m, (turnCost * w[i]) / total));
+        scale = turnCost / total;
+      }
+      // 模型运行时间：duration_api_ms 是累计值，取差；本轮 API 时间不会明显超过本轮总时长
+      for (const ms of [prev ? x.apiMs - prev.apiMs : 0, x.apiMs]) {
+        if (turnCost && ms > 0 && (!x.wallMs || ms <= x.wallMs * 1.1)) {
+          apiSec += ms / 1000;
+          apiCost += turnCost;
+          break;
+        }
+      }
+      prev = x;
+      pending = [];
+    }
+    if (scale) {
+      for (const m of pending) {
+        const out = m.exact ? m.output : Math.max(m.output, m.streamEst, m.blockEst + SIG_TOKENS * m.sig);
+        cost.set(m, scale * weightOf(m, out));
+      }
+    }
+
+    // 第二遍：每个读数对应的会话累计花费。读数在一次请求结束时发出，反映的是这次请求之前的用量
+    const groups = {};
+    let cum = 0;
+    let before = 0;
+    let afterResult = false;
+    let gap = 0; // 遇到算不出花费的请求，之后的读数不能和之前的配对
+    for (const [, kind, x] of items) {
+      if (kind === 0) {
+        if (!cost.has(x)) gap++;
+        before = cum;
+        cum += cost.get(x) || 0;
+        afterResult = false;
+      } else if (kind === 1) afterResult = true;
+      else (groups[x.name + '@' + Math.round(x.resetsAt / 600)] ||= []).push([x.u, afterResult ? cum : before, gap]);
+    }
+
+    // 同一窗口里相邻两次“用量涨了一格”之间：花费差 ÷ 涨过的百分点数
+    const samples = {};
+    for (const key in groups) {
+      const name = key.split('@')[0];
+      let prevU = null;
+      let step = null;
+      for (const [u, c, g] of groups[key]) {
+        if (prevU != null && u > prevU) {
+          const pts = step && step[2] === g ? Math.round((u - step[0]) * 100) : 0;
+          if (pts > 0 && c > step[1]) (samples[name] ||= []).push([(c - step[1]) / pts, pts, step[1], c]);
+          step = [u, c, g];
+        }
+        prevU = u;
+      }
+    }
+    // 别处的使用表现为“一次跳好几格、本会话却没花多少”，这种段的单价明显低于中位数。它同时影响所有
+    // 窗口，但在 7 天这种粗刻度上看不出来，所以按会话花费的区间，把其他窗口里同一段也排除掉
+    const outside = [];
+    for (const name in samples) {
+      const med = weightedMedian(samples[name].map(([v, w]) => [v, w]));
+      for (const [v, w, c0, c1] of samples[name]) if (w > 1 && v < med / 2) outside.push([c0, c1]);
+    }
+    // 其余各段加权平均（等于总花费 ÷ 总百分点数）；单格的段有量化误差，前后会互相抵消
+    const rates = {};
+    for (const name in samples) {
+      const kept = samples[name].filter(([, , c0, c1]) => !outside.some(([o0, o1]) => c0 < o1 && o0 < c1));
+      const points = kept.reduce((s, x) => s + x[1], 0);
+      if (points) rates[name] = [kept.reduce((s, [v, w]) => s + v * w, 0) / points, points];
+    }
+    if (apiCost) rates.sec = [apiSec, apiCost];
+    return rates;
+  }
+
+  // 每个会话的估算按会话路径存进 localStorage，显示时把最近各会话的结果合起来，
+  // 这样换到新会话也能立刻看到，用得越多越准
+  let rateStore = {};
+  try {
+    rateStore = JSON.parse(lsGet('ctm-rates') || '{}') || {};
+  } catch {}
+  let quotaCache = null;
+  let quotaAt = 0;
+  W.addEventListener('storage', (e) => {
+    if (e.key !== 'ctm-rates' || !e.newValue) return;
+    try {
+      rateStore = JSON.parse(e.newValue) || {};
+      quotaCache = null;
+      dirty = true;
+    } catch {}
+  });
+
+  // { 窗口名: { perPoint: 每 1% 美元数, points: 依据的百分点数 }, secPerDollar: 每美元对应的模型运行秒数 }
+  function quotaRates() {
+    const now = Date.now();
+    if (quotaCache && now - quotaAt < 3000) return quotaCache;
+    quotaAt = now;
+    const mine = sessionQuotaRates();
+    const key = location.pathname;
+    if (Object.keys(mine).length && JSON.stringify(mine) !== JSON.stringify(rateStore[key] && rateStore[key].r)) {
+      rateStore[key] = { t: now, r: mine };
+      // 只留最近 30 个会话、45 天以内的
+      const keep = Object.keys(rateStore)
+        .filter((k) => rateStore[k] && now - rateStore[k].t < 45 * 864e5)
+        .sort((a, b) => rateStore[b].t - rateStore[a].t)
+        .slice(0, 30);
+      rateStore = Object.fromEntries(keep.map((k) => [k, rateStore[k]]));
+      lsSet('ctm-rates', JSON.stringify(rateStore));
+    }
+    const acc = {};
+    let sec = 0;
+    let dollars = 0;
+    for (const k in rateStore) {
+      const r = (rateStore[k] && rateStore[k].r) || {};
+      for (const name in r) {
+        const [a, b] = r[name] || [];
+        if (name === 'sec') {
+          sec += num(a);
+          dollars += num(b);
+        } else if (num(a) > 0 && num(b) > 0) {
+          const s = (acc[name] ||= { sum: 0, points: 0 });
+          s.sum += a * b;
+          s.points += b;
+        }
+      }
+    }
+    const out = {};
+    for (const name in acc) out[name] = { perPoint: acc[name].sum / acc[name].points, points: acc[name].points };
+    if (sec > 0 && dollars > 0) out.secPerDollar = sec / dollars;
+    return (quotaCache = out);
   }
 
   // ---------------------------------------------------------------- 网络挂钩
@@ -630,6 +870,8 @@
   const fmtSpeed = (s) => (s == null ? '–' : s.toFixed(1));
   const fmtPct = (f) => Math.round(f * 100) + '%';
   const fmtCost = (c, short) => '$' + c.toFixed(short ? (c < 0.1 ? 3 : 2) : c >= 10 ? 2 : 4);
+  const fmtUsd = (v, precise) => '$' + (precise ? v.toFixed(2) : v >= 10 ? Math.round(v).toLocaleString() : v.toFixed(1));
+  const fmtHours = (h) => (h < 1 ? Math.max(1, Math.round(h * 60)) + ' 分钟' : (h < 10 ? h.toFixed(1) : Math.round(h)) + ' 小时');
 
   function fmtReset(sec) {
     const d = new Date(sec * 1000);
@@ -973,6 +1215,14 @@
     if (!r) {
       r = addRow(ui.limitsBox, l.label, '');
       r.meter = meter(ui.limitsBox);
+      r.est = el('div', {
+        color: 'var(--ctm-ink2)',
+        fontSize: '11px',
+        textAlign: 'right',
+        margin: '-3px 0 4px',
+        fontVariantNumeric: 'tabular-nums',
+      });
+      ui.limitsBox.append(r.est);
       ui.limitRows[l.name] = r;
     }
     return r;
@@ -1048,6 +1298,8 @@
     if (!ui.root) return;
     if (tick++ % 4 === 0) applyTheme(pageIsDark() ? 'dark' : 'light');
     paint(false);
+    // 收起时也定期算一次并存下来，下次换会话时能直接用
+    if (state.readings.length && Date.now() - quotaAt > 30000) quotaRates();
   }
 
   function paint(force) {
@@ -1121,8 +1373,23 @@
     ui.context.textContent = c ? fmt(c.used) + (c.max ? ' / ' + fmt(c.max) + ' · ' + fmtPct(frac) : '') : '–';
     setMeter(ui.ctxMeter, frac, levelOf(frac, 0.7, 0.9));
 
+    const rates = lims.length ? quotaRates() : {};
     for (const l of lims) {
       const r = limitRow(l);
+      const q = rates[l.name];
+      if (q) {
+        const full = q.perPoint * 100; // 整个窗口折合的美元
+        const left = Math.max(0, 1 - l.used) * full;
+        const hours = rates.secPerDollar ? (left * rates.secPerDollar) / 3600 : null;
+        r.est.textContent = l.used >= 1 ? '已用完' : '约剩 ' + fmtUsd(left) + (hours == null ? '' : ' · ' + fmtHours(hours));
+        r.est.title =
+          `按 API 标价折算，整个 ${l.label}约 ${fmtUsd(full)}（每 1% ≈ ${fmtUsd(q.perPoint, true)}，依据 ${q.points} 个百分点的变化）` +
+          (rates.secPerDollar ? `；按你最近的用法，模型每运行 1 小时约花 ${fmtUsd(3600 / rates.secPerDollar)}` : '') +
+          '。只是估算：假设统计期间账号没有别处的使用；换模型或用法差别很大时会不准。';
+      } else {
+        r.est.textContent = '剩余：估算中';
+        r.est.title = '这个页面看到这项额度涨过至少两次后，才能估算它折合多少钱';
+      }
       r.value.textContent = l.expired ? '已重置' : fmtPct(l.used) + ' · ' + fmtReset(l.resetsAt) + ' 重置';
       r.row.title = l.expired
         ? '已过重置时间，下一次请求后显示新窗口的用量'
@@ -1158,6 +1425,7 @@
     },
     totals: sessionTotals,
     context: contextNow,
+    quota: () => ({ session: sessionQuotaRates(), combined: quotaRates() }),
     mode: (m) => setMode(m === 'full' ? 'full' : 'compact'),
     reset,
     debug(on = true) {
