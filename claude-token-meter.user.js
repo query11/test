@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.3.0
+// @version      1.3.1
 // @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示 token 用量与生成速度
 // @match        https://claude.ai/*
 // @run-at       document-start
@@ -87,7 +87,7 @@
   // 每条记录带 live（实时到达而非历史加载）、到达序号 seq 和 ts（事件自带的时间戳，可能没有）。
   // 实时事件按到达顺序；历史记录常常是倒序加载的，只能看时间戳。
   function stamp(ctx, fallbackTs) {
-    return { ts: ctx.ts || fallbackTs || 0, live: !ctx.bulk, seq: ++state.seq };
+    return { ts: ctx.ts || fallbackTs || 0, live: !ctx.bulk, seq: ++state.seq, at: Date.now() };
   }
 
   // a 是否确定晚于 b；判断不了时返回 false
@@ -549,6 +549,7 @@
   // 各类 token 的相对价格（以输入为 1）。只用来在一轮之内分摊花费，每轮总花费以 result 为准
   const PRICE_RATIO = { input: 1, output: 5, cacheRead: 0.05, cacheWrite: 2 };
   const SIG_TOKENS = 0.24; // 思考签名每个字符大约对应的思考 token 数
+  const IDLE_GAP_MS = 300000; // 会话闲置超过 5 分钟，前后的读数不配对：期间别处的使用会混进来
   const weightOf = (x, out) =>
     x.input * PRICE_RATIO.input +
     out * PRICE_RATIO.output +
@@ -626,8 +627,12 @@
     let cum = 0;
     let before = 0;
     let afterResult = false;
-    let gap = 0; // 遇到算不出花费的请求，之后的读数不能和之前的配对
+    let gap = 0; // 遇到算不出花费的请求或长时间闲置，之后的读数不能和之前的配对
+    let lastWall = 0;
     for (const [, kind, x] of items) {
+      const wall = x.live ? x.at : x.ts; // 实时事件用到达时间，历史记录用事件时间
+      if (lastWall && wall - lastWall > IDLE_GAP_MS) gap++;
+      lastWall = wall;
       if (kind === 0) {
         if (!cost.has(x)) gap++;
         before = cum;
@@ -641,22 +646,25 @@
     const samples = {};
     for (const key in groups) {
       const name = key.split('@')[0];
-      let prevU = null;
+      let prev = null;
       let step = null;
       for (const [u, c, g] of groups[key]) {
-        if (prevU != null && u > prevU) {
+        // 只有和上一个读数在同一段连续使用里、而且变大了，才是“刚跨过一格”。闲置之后的第一个读数
+        // 可能早就跨过去了（别处用的），不能当起点
+        if (prev && prev[1] === g && u > prev[0]) {
           const pts = step && step[2] === g ? Math.round((u - step[0]) * 100) : 0;
           if (pts > 0 && c > step[1]) (samples[name] ||= []).push([(c - step[1]) / pts, pts, step[1], c]);
           step = [u, c, g];
         }
-        prevU = u;
+        prev = [u, g];
       }
     }
     // 别处的使用表现为“一次跳好几格、本会话却没花多少”，这种段的单价明显低于中位数。它同时影响所有
     // 窗口，但在 7 天这种粗刻度上看不出来，所以按会话花费的区间，把其他窗口里同一段也排除掉
     const outside = [];
     for (const name in samples) {
-      const med = weightedMedian(samples[name].map(([v, w]) => [v, w]));
+      // 中位数不按格数加权：否则一次跳很多格的异常段自己就成了中位数
+      const med = weightedMedian(samples[name].map(([v]) => [v, 1]));
       for (const [v, w, c0, c1] of samples[name]) if (w > 1 && v < med / 2) outside.push([c0, c1]);
     }
     // 其余各段加权平均（等于总花费 ÷ 总百分点数）；单格的段有量化误差，前后会互相抵消
@@ -672,14 +680,17 @@
 
   // 每个会话的估算按会话路径存进 localStorage，显示时把最近各会话的结果合起来，
   // 这样换到新会话也能立刻看到，用得越多越准
+  // v2：1.3.0 存的估算没有排除闲置期间别处的使用，可能偏小，直接丢弃
+  const RATE_KEY = 'ctm-rates-v2';
   let rateStore = {};
   try {
-    rateStore = JSON.parse(lsGet('ctm-rates') || '{}') || {};
+    localStorage.removeItem('ctm-rates');
+    rateStore = JSON.parse(lsGet(RATE_KEY) || '{}') || {};
   } catch {}
   let quotaCache = null;
   let quotaAt = 0;
   W.addEventListener('storage', (e) => {
-    if (e.key !== 'ctm-rates' || !e.newValue) return;
+    if (e.key !== RATE_KEY || !e.newValue) return;
     try {
       rateStore = JSON.parse(e.newValue) || {};
       quotaCache = null;
@@ -687,7 +698,7 @@
     } catch {}
   });
 
-  // { 窗口名: { perPoint: 每 1% 美元数, points: 依据的百分点数 }, secPerDollar: 每美元对应的模型运行秒数 }
+  // { 窗口名: { perPoint: 每 1% 美元数, points: 依据的百分点数, dollars: 依据的花费 }, secPerDollar: 每美元对应的模型运行秒数 }
   function quotaRates() {
     const now = Date.now();
     if (quotaCache && now - quotaAt < 3000) return quotaCache;
@@ -702,7 +713,7 @@
         .sort((a, b) => rateStore[b].t - rateStore[a].t)
         .slice(0, 30);
       rateStore = Object.fromEntries(keep.map((k) => [k, rateStore[k]]));
-      lsSet('ctm-rates', JSON.stringify(rateStore));
+      lsSet(RATE_KEY, JSON.stringify(rateStore));
     }
     const acc = {};
     let sec = 0;
@@ -715,14 +726,19 @@
           sec += num(a);
           dollars += num(b);
         } else if (num(a) > 0 && num(b) > 0) {
-          const s = (acc[name] ||= { sum: 0, points: 0 });
-          s.sum += a * b;
+          // 各会话按花费加权：被别处使用污染的会话“格数多、花费少”，按格数加权会被它带偏
+          const s = (acc[name] ||= { sum: 0, dollars: 0, points: 0 });
+          s.sum += a * a * b;
+          s.dollars += a * b;
           s.points += b;
         }
       }
     }
     const out = {};
-    for (const name in acc) out[name] = { perPoint: acc[name].sum / acc[name].points, points: acc[name].points };
+    for (const name in acc) {
+      const a = acc[name];
+      out[name] = { perPoint: a.sum / a.dollars, points: a.points, dollars: a.dollars };
+    }
     if (sec > 0 && dollars > 0) out.secPerDollar = sec / dollars;
     return (quotaCache = out);
   }
@@ -1383,7 +1399,7 @@
         const hours = rates.secPerDollar ? (left * rates.secPerDollar) / 3600 : null;
         r.est.textContent = l.used >= 1 ? '已用完' : '约剩 ' + fmtUsd(left) + (hours == null ? '' : ' · ' + fmtHours(hours));
         r.est.title =
-          `按 API 标价折算，整个 ${l.label}约 ${fmtUsd(full)}（每 1% ≈ ${fmtUsd(q.perPoint, true)}，依据 ${q.points} 个百分点的变化）` +
+          `按 API 标价折算，整个 ${l.label}约 ${fmtUsd(full)}（每 1% ≈ ${fmtUsd(q.perPoint, true)}，依据 ${q.points} 个百分点、${fmtUsd(q.dollars)} 的花费）` +
           (rates.secPerDollar ? `；按你最近的用法，模型每运行 1 小时约花 ${fmtUsd(3600 / rates.secPerDollar)}` : '') +
           '。只是估算：假设统计期间账号没有别处的使用；换模型或用法差别很大时会不准。';
       } else {
