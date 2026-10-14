@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.1.0
+// @version      1.2.0
 // @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示 token 用量与生成速度
 // @match        https://claude.ai/*
 // @run-at       document-start
@@ -19,6 +19,7 @@
  *                                                    → 实时速度；message_delta 带精确输出数，用来校准估算
  *   - result.usage.output_tokens 与 duration_api_ms 的增量 → 上一轮的平均速度
  *   - get_context_usage 的响应                        → 上下文占用（网页端查询上下文时才有）
+ *   - rate_limit_event 的 unifiedWindows             → 订阅额度（5 小时 / 7 天窗口的已用比例与重置时间）
  * 历史记录（一次加载多条）只计入用量，不计入速度。思考内容在网页端不可见，只能从精确数里看到。
  *
  * 控制台可用：__ctm.state 查看状态，__ctm.debug(true) 打印抓到的数据。
@@ -206,6 +207,60 @@
     dirty = true;
   }
 
+  // ---------------------------------------------------------------- 订阅额度
+
+  // [完整名称, 简称]；未列出的窗口直接显示原名
+  const LIMIT_NAMES = {
+    five_hour: ['5 小时额度', '5h'],
+    seven_day: ['7 天额度', '7d'],
+    seven_day_opus: ['7 天 Opus', '7d Opus'],
+    seven_day_sonnet: ['7 天 Sonnet', '7d Sonnet'],
+    seven_day_overage_included: ['7 天（含超额）', '7d+'],
+  };
+
+  // 额度是账号级的，不随会话清零，并存进 localStorage：刷新页面、打开别的会话时也能立刻显示。
+  // name -> { utilization: 已用比例（通常 0~1）, resetsAt: 重置时间（unix 秒）, status }
+  let limits = {};
+  try {
+    limits = JSON.parse(lsGet('ctm-limits') || '{}') || {};
+  } catch {}
+
+  // 同一窗口内用量只增不减，所以不论事件先后，同一 resetsAt 取最大值；resetsAt 更晚的是新窗口
+  function recordLimits(info) {
+    if (!info || typeof info !== 'object') return;
+    const windows = { ...(info.unifiedWindows || {}) };
+    // 顶层字段描述的是当前起限制作用的那个窗口（旧版 CLI 只有这一份），可能是 overage 这类不是额度窗口的类型
+    if (LIMIT_NAMES[info.rateLimitType] && !windows[info.rateLimitType] && info.resetsAt) {
+      windows[info.rateLimitType] = { utilization: info.utilization, resetsAt: info.resetsAt };
+    }
+    let changed = false;
+    for (const name in windows) {
+      const w = windows[name] || {};
+      const resetsAt = num(w.resetsAt);
+      if (!resetsAt) continue;
+      const utilization = num(w.utilization);
+      const cur = limits[name];
+      const same = !!cur && Math.abs(resetsAt - cur.resetsAt) <= 60;
+      if (cur && (same ? utilization < cur.utilization : resetsAt < cur.resetsAt)) continue;
+      const status = w.status || (name === info.rateLimitType ? info.status : same ? cur.status : undefined);
+      if (same && utilization === cur.utilization && status === cur.status) continue;
+      limits[name] = { utilization, resetsAt, status };
+      changed = true;
+    }
+    if (changed) {
+      lsSet('ctm-limits', JSON.stringify(limits));
+      dirty = true;
+    }
+  }
+
+  // 其他 claude.ai 标签页看到的额度也合并进来
+  W.addEventListener('storage', (e) => {
+    if (e.key !== 'ctm-limits' || !e.newValue) return;
+    try {
+      recordLimits({ unifiedWindows: JSON.parse(e.newValue) });
+    } catch {}
+  });
+
   // ---------------------------------------------------------------- 事件识别
 
   function tsOf(o) {
@@ -282,7 +337,14 @@
       case 'result':
         recordResult(o, ctx);
         return true;
+      case 'rate_limit_event':
+        recordLimits(o.rate_limit_info);
+        return true;
       default: {
+        if (o.rate_limit_info && typeof o.rate_limit_info === 'object') {
+          recordLimits(o.rate_limit_info);
+          return true;
+        }
         if (typeof o.totalTokens === 'number' && typeof o.maxTokens === 'number' && 'percentage' in o) {
           state.ctxUsage = { ...stamp(ctx), used: o.totalTokens, max: o.maxTokens };
           dirty = true;
@@ -323,7 +385,7 @@
     for (const k in o) {
       const v = o[k];
       if (v && typeof v === 'object') walk(v, ctx, depth + 1);
-      else if (typeof v === 'string' && v.length > 20 && (v[0] === '{' || v[0] === '[') && /tokens|delta|_start|_stop/i.test(v)) {
+      else if (typeof v === 'string' && v.length > 20 && (v[0] === '{' || v[0] === '[') && /tokens|delta|_start|_stop|rate_limit/i.test(v)) {
         try {
           walk(JSON.parse(v), ctx, depth + 1);
         } catch {}
@@ -359,7 +421,7 @@
 
   function ingestText(text, src) {
     if (typeof text !== 'string' || !text || text.length > 50e6) return;
-    if (!/tokens|_delta|_start|_stop/i.test(text)) return; // message_stop / content_block_start 不含 tokens
+    if (!/tokens|_delta|_start|_stop|rate_limit/i.test(text)) return; // message_stop、content_block_start、rate_limit_event 里没有 tokens
     try {
       ingestObj(JSON.parse(text), src);
       return;
@@ -566,6 +628,96 @@
     return n.toLocaleString();
   };
   const fmtSpeed = (s) => (s == null ? '–' : s.toFixed(1));
+  const fmtPct = (f) => Math.round(f * 100) + '%';
+  const fmtCost = (c, short) => '$' + c.toFixed(short ? (c < 0.1 ? 3 : 2) : c >= 10 ? 2 : 4);
+
+  function fmtReset(sec) {
+    const d = new Date(sec * 1000);
+    const hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const days = Math.round((day(d) - day(new Date())) / 864e5);
+    return days === 0 ? hm : days === 1 ? '明天 ' + hm : d.getMonth() + 1 + '/' + d.getDate() + ' ' + hm;
+  }
+
+  function fmtLeft(sec) {
+    const m = Math.max(0, Math.round((sec * 1000 - Date.now()) / 60000));
+    const d = Math.floor(m / 1440);
+    const h = Math.floor((m % 1440) / 60);
+    if (d) return (d + ' 天 ' + (h ? h + ' 小时' : '')).trim();
+    return (h ? h + ' 小时 ' : '') + (m % 60) + ' 分钟';
+  }
+
+  // 颜色取自 dataviz 参考调色板：浅色、深色各自选定的墨色与表面色；状态色固定，不随主题变
+  const THEMES = {
+    light: {
+      surface: 'rgba(252,252,251,0.96)',
+      ink: '#0b0b0b',
+      ink2: '#52514e',
+      muted: '#898781',
+      hair: 'rgba(11,11,11,0.10)',
+      control: 'rgba(11,11,11,0.18)',
+      shadow: '0 4px 16px rgba(0,0,0,0.12)',
+      accent: '#2a78d6',
+      trackAlpha: 0.18,
+    },
+    dark: {
+      surface: 'rgba(26,26,25,0.94)',
+      ink: '#f0efec',
+      ink2: '#c3c2b7',
+      muted: '#898781',
+      hair: 'rgba(255,255,255,0.10)',
+      control: 'rgba(255,255,255,0.18)',
+      shadow: '0 4px 20px rgba(0,0,0,0.45)',
+      accent: '#3987e5',
+      trackAlpha: 0.28,
+    },
+  };
+  const STATUS = { good: '#0ca30c', warning: '#fab219', critical: '#d03b3b' };
+  let theme = THEMES.dark;
+  let themeName = '';
+
+  const tint = (hex, a) =>
+    `rgba(${parseInt(hex.slice(1, 3), 16)},${parseInt(hex.slice(3, 5), 16)},${parseInt(hex.slice(5, 7), 16)},${a})`;
+
+  // 返回颜色的亮度（0~1）；透明或解析不了时返回 null。用 1 像素画布换算，任何 CSS 颜色写法都能处理
+  let probe = null;
+  function luminance(color) {
+    if (!probe) {
+      const c = document.createElement('canvas');
+      c.width = c.height = 1;
+      probe = c.getContext('2d', { willReadFrequently: true });
+    }
+    probe.fillStyle = '#010203';
+    probe.fillStyle = color;
+    if (probe.fillStyle === '#010203') return null;
+    probe.clearRect(0, 0, 1, 1);
+    probe.fillRect(0, 0, 1, 1);
+    const [r, g, b, a] = probe.getImageData(0, 0, 1, 1).data;
+    return a < 128 ? null : (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  }
+
+  // 看页面实际的背景色：claude.ai 的主题可以和系统设置不一样
+  function pageIsDark() {
+    for (const n of [document.body, document.documentElement]) {
+      const l = n && luminance(getComputedStyle(n).backgroundColor);
+      if (l != null) return l < 0.5;
+    }
+    const h = document.documentElement;
+    const hint = h.className + ' ' + (h.dataset.theme || '') + ' ' + (h.dataset.mode || '');
+    if (/\bdark\b/i.test(hint)) return true;
+    if (/\blight\b/i.test(hint)) return false;
+    return W.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+
+  function applyTheme(name) {
+    if (name === themeName) return;
+    themeName = name;
+    theme = THEMES[name];
+    for (const k in theme) if (typeof theme[k] === 'string') ui.root.style.setProperty('--ctm-' + k, theme[k]);
+    ui.root.style.colorScheme = name;
+    pillKey = '';
+    dirty = true;
+  }
 
   function el(tag, style, text) {
     const e = document.createElement(tag);
@@ -574,54 +726,193 @@
     return e;
   }
 
-  const ui = {};
+  const dot = () => el('span', { width: '8px', height: '8px', borderRadius: '50%', flex: 'none', transition: 'opacity .3s' });
+
+  function addRow(parent, label, tip) {
+    const row = el('div', { display: 'flex', justifyContent: 'space-between', gap: '8px' });
+    const value = el('span', { color: 'var(--ctm-ink)', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }, '–');
+    row.append(el('span', { color: 'var(--ctm-ink2)', whiteSpace: 'nowrap' }, label), value);
+    if (tip) row.title = tip;
+    parent.append(row);
+    return { row, value };
+  }
+
+  // 比例条：填充色表示程度（正常用强调色，偏高用警告色，接近上限用危险色），底槽是同一色调的浅色
+  function meter(parent) {
+    const track = el('div', { height: '4px', borderRadius: '2px', margin: '1px 0 5px', overflow: 'hidden' });
+    const fill = el('div', { height: '100%', width: '0', borderRadius: '2px' });
+    track.append(fill);
+    parent.append(track);
+    return { track, fill };
+  }
+
+  function setMeter(m, frac, level) {
+    const color = level === 'normal' ? theme.accent : STATUS[level];
+    m.fill.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
+    m.fill.style.background = color;
+    m.track.style.background = tint(color, theme.trackAlpha);
+  }
+
+  const levelOf = (frac, warn, crit) => (frac >= crit ? 'critical' : frac >= warn ? 'warning' : 'normal');
+
+  function limitViews() {
+    const now = Date.now() / 1000;
+    const order = Object.keys(LIMIT_NAMES);
+    const rank = (name) => order.indexOf(name) + 1 || 99;
+    return Object.keys(limits)
+      .filter((name) => limits[name] && num(limits[name].resetsAt))
+      .sort((a, b) => rank(a) - rank(b))
+      .map((name) => {
+        const l = limits[name];
+        const expired = now >= l.resetsAt;
+        const used = expired ? 0 : num(l.utilization);
+        const level = expired
+          ? 'normal'
+          : l.status === 'rejected' || used >= 0.9
+            ? 'critical'
+            : l.status === 'allowed_warning' || used >= 0.75
+              ? 'warning'
+              : 'normal';
+        const [label, short] = LIMIT_NAMES[name] || [name, name];
+        return { name, label, short, used, expired, level, resetsAt: l.resetsAt };
+      });
+  }
+
+  const ui = { limitRows: {} };
+  let mode = lsGet('ctm-mode') === 'full' ? 'full' : 'compact';
+  let pos = { h: 'right', x: 16, v: 'bottom', y: 16 }; // 贴着哪个角、离两边多远
+  try {
+    const p = JSON.parse(lsGet('ctm-anchor') || 'null');
+    if (p && /^(left|right)$/.test(p.h) && /^(top|bottom)$/.test(p.v)) pos = { h: p.h, x: num(p.x), v: p.v, y: num(p.y) };
+  } catch {}
+
+  function applyPos() {
+    const s = ui.root.style;
+    s.left = s.right = s.top = s.bottom = 'auto';
+    s[pos.h] = pos.x + 'px';
+    s[pos.v] = pos.y + 'px';
+  }
+
+  // 窗口变小或面板展开后超出视口时临时收回来，不改保存的位置
+  function keepInView() {
+    const r = ui.root.getBoundingClientRect();
+    const s = ui.root.style;
+    s[pos.h] = Math.max(0, Math.min(pos.x, innerWidth - r.width)) + 'px';
+    s[pos.v] = Math.max(0, Math.min(pos.y, innerHeight - r.height)) + 'px';
+  }
+
+  // 拖动移动；没拖动就当作点击
+  function draggable(handle, onClick) {
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      const r = ui.root.getBoundingClientRect();
+      const sx = e.clientX;
+      const sy = e.clientY;
+      let moved = false;
+      handle.setPointerCapture(e.pointerId);
+      const move = (ev) => {
+        if (!moved && Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) < 4) return;
+        moved = true;
+        const left = Math.min(Math.max(0, r.left + ev.clientX - sx), innerWidth - r.width);
+        const top = Math.min(Math.max(0, r.top + ev.clientY - sy), innerHeight - r.height);
+        Object.assign(ui.root.style, { left: left + 'px', top: top + 'px', right: 'auto', bottom: 'auto' });
+      };
+      const up = () => {
+        handle.removeEventListener('pointermove', move);
+        handle.removeEventListener('pointerup', up);
+        handle.removeEventListener('pointercancel', up);
+        if (!moved) return onClick && onClick();
+        // 按离得最近的角保存位置，展开、收起时朝远离这个角的方向伸缩
+        const b = ui.root.getBoundingClientRect();
+        const h = b.left + b.width / 2 > innerWidth / 2 ? 'right' : 'left';
+        const v = b.top + b.height / 2 > innerHeight / 2 ? 'bottom' : 'top';
+        pos = {
+          h,
+          x: Math.round(h === 'right' ? innerWidth - b.right : b.left),
+          v,
+          y: Math.round(v === 'bottom' ? innerHeight - b.bottom : b.top),
+        };
+        lsSet('ctm-anchor', JSON.stringify(pos));
+        applyPos();
+      };
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', up);
+      handle.addEventListener('pointercancel', up);
+      e.preventDefault();
+    });
+  }
+
+  function setMode(m) {
+    mode = m;
+    lsSet('ctm-mode', m);
+    ui.pill.style.display = m === 'compact' ? 'flex' : 'none';
+    ui.full.style.display = m === 'full' ? 'block' : 'none';
+    ui.root.style.borderRadius = m === 'compact' ? '999px' : '10px';
+    pillKey = '';
+    paint(true);
+    applyPos();
+    keepInView();
+  }
 
   function buildUI() {
     const root = el('div', {
       position: 'fixed',
-      right: '16px',
-      bottom: '16px',
       zIndex: '2147483647',
-      width: '240px',
-      background: 'rgba(24,24,27,0.92)',
-      color: '#e4e4e7',
-      font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-      borderRadius: '10px',
-      boxShadow: '0 4px 20px rgba(0,0,0,0.35)',
-      border: '1px solid rgba(255,255,255,0.08)',
+      background: 'var(--ctm-surface)',
+      color: 'var(--ctm-ink)',
+      font: '12px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif',
+      border: '1px solid var(--ctm-hair)',
+      boxShadow: 'var(--ctm-shadow)',
       userSelect: 'none',
       backdropFilter: 'blur(6px)',
     });
-    const pos = lsGet('ctm-pos');
-    if (pos) {
-      try {
-        const { left, top } = JSON.parse(pos);
-        Object.assign(root.style, { left: left + 'px', top: top + 'px', right: 'auto', bottom: 'auto' });
-      } catch {}
-    }
+    ui.root = root;
 
+    // 紧凑模式：一行摘要，点击展开
+    ui.pill = el('div', {
+      alignItems: 'center',
+      gap: '6px',
+      padding: '3px 10px',
+      cursor: 'pointer',
+      whiteSpace: 'nowrap',
+      fontVariantNumeric: 'tabular-nums',
+    });
+    ui.pill.tabIndex = 0;
+    ui.pill.setAttribute('role', 'button');
+    ui.pill.title = '速度（空闲时为上轮均速）· 上下文 · 订阅额度 · API 等价费用\n点击展开，拖动可移动';
+    ui.pillDot = dot();
+    ui.pillText = el('span', { display: 'flex', alignItems: 'center', gap: '5px' });
+    ui.pill.append(ui.pillDot, ui.pillText);
+    ui.pill.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      setMode('full');
+    });
+    draggable(ui.pill, () => setMode('full'));
+
+    // 完整面板
+    ui.full = el('div', { width: '240px' });
     const header = el('div', {
       display: 'flex',
       alignItems: 'center',
       gap: '6px',
       padding: '6px 8px',
       cursor: 'move',
-      borderBottom: '1px solid rgba(255,255,255,0.08)',
+      borderBottom: '1px solid var(--ctm-hair)',
     });
-    ui.dot = el('span', { width: '8px', height: '8px', borderRadius: '50%', background: '#52525b', flex: 'none' });
-    ui.title = el('span', { flex: '1', fontWeight: '600' }, 'Token Meter');
+    ui.dot = dot();
     const btn = (label, tip, onClick) => {
       const b = el('button', {
         background: 'transparent',
-        color: '#a1a1aa',
-        border: '1px solid rgba(255,255,255,0.15)',
+        color: 'var(--ctm-ink2)',
+        border: '1px solid var(--ctm-control)',
         borderRadius: '4px',
         padding: '0 5px',
         font: 'inherit',
         cursor: 'pointer',
       }, label);
       b.title = tip;
-      b.addEventListener('mousedown', (e) => e.stopPropagation());
+      b.addEventListener('pointerdown', (e) => e.stopPropagation());
       b.addEventListener('click', onClick);
       return b;
     };
@@ -630,83 +921,61 @@
       lsSet('ctm-debug', debug ? '1' : '0');
       dirty = true;
     });
-    const resetBtn = btn('↺', '清零', reset);
-    ui.foldBtn = btn('–', '折叠/展开', () => {
-      const folded = ui.body.style.display !== 'none';
-      ui.body.style.display = folded ? 'none' : 'block';
-      ui.foldBtn.textContent = folded ? '+' : '–';
-      lsSet('ctm-folded', folded ? '1' : '0');
-    });
-    header.append(ui.dot, ui.title, ui.debugBtn, resetBtn, ui.foldBtn);
+    header.append(
+      ui.dot,
+      el('span', { flex: '1', fontWeight: '600' }, 'Token Meter'),
+      ui.debugBtn,
+      btn('↺', '清零（订阅额度不清）', reset),
+      btn('–', '收起成一行', () => setMode('compact'))
+    );
+    draggable(header);
 
-    ui.body = el('div', { padding: '6px 10px 8px' });
-    const rows = [
-      ['speed', '实时速度', '最近 2 秒可见输出的速度（按字符估算，并用精确值自动校准）'],
-      ['cur', '当前请求', '正在流式输出的这次 API 请求'],
-      ['last', '上次请求', '上一次 API 请求的输出 token 数与平均速度；有精确数时包含看不见的思考'],
-      ['turn', '上轮均速', ''],
-      ['peak', '峰值速度', ''],
-      ['sep'],
-      ['context', '上下文', '主对话最近一次请求的输入 token（含缓存）/ 模型上下文窗口'],
-      ['bar'],
-      ['input', '输入', '未命中缓存的输入 token'],
-      ['output', '输出', '含思考 token。≈ 表示本轮还没结束，未结束部分按正文估算（看不到思考，会偏低）'],
-      ['cacheRead', '缓存读取', ''],
-      ['cacheWrite', '缓存写入', ''],
-      ['total', '合计', '输入 + 输出 + 缓存读写'],
-      ['cost', 'API 等价费用', 'Claude Code 按 API 标价估算的累计费用；订阅用户不按此计费'],
-    ];
-    for (const [key, label, tip] of rows) {
-      if (key === 'sep') {
-        ui.body.append(el('div', { borderTop: '1px solid rgba(255,255,255,0.08)', margin: '4px 0' }));
-        continue;
-      }
-      if (key === 'bar') {
-        const track = el('div', { height: '3px', borderRadius: '2px', background: 'rgba(255,255,255,0.1)', margin: '1px 0 4px' });
-        ui.bar = el('div', { height: '100%', width: '0', borderRadius: '2px', background: '#60a5fa' });
-        track.append(ui.bar);
-        ui.body.append(track);
-        continue;
-      }
-      const row = el('div', { display: 'flex', justifyContent: 'space-between', gap: '8px' });
-      const v = el('span', { color: '#fafafa', textAlign: 'right' }, '–');
-      row.append(el('span', { color: '#a1a1aa' }, label), v);
-      if (tip) row.title = tip;
-      ui[key] = v;
-      ui[key + 'Row'] = row;
-      ui.body.append(row);
-    }
+    const body = el('div', { padding: '6px 10px 8px' });
+    const sep = () => body.append(el('div', { borderTop: '1px solid var(--ctm-hair)', margin: '4px 0' }));
+    const row = (key, label, tip) => {
+      const r = addRow(body, label, tip);
+      ui[key] = r.value;
+      ui[key + 'Row'] = r.row;
+    };
+    row('speed', '实时速度', '最近 2 秒可见输出的速度（按字符估算，并用精确值自动校准）');
+    row('cur', '当前请求', '正在流式输出的这次 API 请求');
+    row('last', '上次请求', '上一次 API 请求的输出 token 数与平均速度；有精确数时包含看不见的思考');
+    row('turn', '上轮均速', '');
+    row('peak', '峰值速度', '');
+    sep();
+    row('context', '上下文', '主对话最近一次请求的输入 token（含缓存）/ 模型上下文窗口');
+    ui.ctxMeter = meter(body);
+    ui.limitsBox = el('div');
+    body.append(ui.limitsBox);
+    sep();
+    row('input', '输入', '未命中缓存的输入 token');
+    row('output', '输出', '含思考 token。≈ 表示本轮还没结束，未结束部分按正文估算（看不到思考，会偏低）');
+    row('cacheRead', '缓存读取', '');
+    row('cacheWrite', '缓存写入', '');
+    row('total', '合计', '输入 + 输出 + 缓存读写');
+    row('cost', 'API 等价费用', 'Claude Code 按 API 标价估算的累计费用；订阅用户不按此计费');
     ui.canvas = el('canvas', { width: '100%', height: '36px', marginTop: '6px', display: 'block' });
-    ui.body.append(ui.canvas);
-    if (lsGet('ctm-folded') === '1') {
-      ui.body.style.display = 'none';
-      ui.foldBtn.textContent = '+';
-    }
+    body.append(ui.canvas);
 
-    root.append(header, ui.body);
-    ui.root = root;
-
-    // 拖动
-    header.addEventListener('mousedown', (e) => {
-      const r = root.getBoundingClientRect();
-      const dx = e.clientX - r.left;
-      const dy = e.clientY - r.top;
-      const move = (ev) => {
-        const left = Math.min(Math.max(0, ev.clientX - dx), innerWidth - r.width);
-        const top = Math.min(Math.max(0, ev.clientY - dy), innerHeight - 30);
-        Object.assign(root.style, { left: left + 'px', top: top + 'px', right: 'auto', bottom: 'auto' });
-      };
-      const up = () => {
-        removeEventListener('mousemove', move);
-        removeEventListener('mouseup', up);
-        lsSet('ctm-pos', JSON.stringify({ left: parseFloat(root.style.left), top: parseFloat(root.style.top) }));
-      };
-      addEventListener('mousemove', move);
-      addEventListener('mouseup', up);
-      e.preventDefault();
-    });
-
+    ui.full.append(header, body);
+    root.append(ui.pill, ui.full);
     document.body.append(root);
+    applyTheme(pageIsDark() ? 'dark' : 'light');
+    setMode(mode);
+    W.addEventListener('resize', () => {
+      applyPos();
+      keepInView();
+    });
+  }
+
+  function limitRow(l) {
+    let r = ui.limitRows[l.name];
+    if (!r) {
+      r = addRow(ui.limitsBox, l.label, '');
+      r.meter = meter(ui.limitsBox);
+      ui.limitRows[l.name] = r;
+    }
+    return r;
   }
 
   function currentSpeed(now, active) {
@@ -733,7 +1002,7 @@
     g.clearRect(0, 0, w, h);
     const data = state.spark;
     const max = Math.max(10, ...data);
-    g.strokeStyle = 'rgba(255,255,255,0.08)';
+    g.strokeStyle = theme.hair;
     g.beginPath();
     g.moveTo(0, h - 0.5);
     g.lineTo(w, h - 0.5);
@@ -747,17 +1016,22 @@
       const y = h - 2 - (v / max) * (h - 6);
       i ? g.lineTo(x, y) : g.moveTo(x, y);
     });
-    g.strokeStyle = '#f59e0b';
+    g.strokeStyle = theme.accent;
     g.lineWidth = 1.5;
     g.stroke();
     g.lineTo(w, h);
     g.lineTo(x0, h);
     g.closePath();
-    g.fillStyle = 'rgba(245,158,11,0.15)';
+    g.fillStyle = tint(theme.accent, 0.15);
     g.fill();
-    g.fillStyle = '#71717a';
+    g.fillStyle = theme.muted;
     g.fillText(Math.round(max) + ' tok/s', 2, 9);
   }
+
+  let live = { active: null, flowing: false, speed: 0 };
+  let tick = 0;
+  let paintedAt = 0;
+  let pillKey = '';
 
   function render() {
     const now = performance.now();
@@ -767,24 +1041,67 @@
       if (!s.bulk && (!active || (s.last || s.t0) > (active.last || active.t0))) active = s;
     }
     const flowing = !!active && !!active.last && now - active.last < FLOW_MS;
-    const speed = flowing ? currentSpeed(now, active) : 0;
-    state.spark.push(speed);
+    live = { active, flowing, speed: flowing ? currentSpeed(now, active) : 0 };
+    state.spark.push(live.speed);
     if (state.spark.length > SPARK_POINTS) state.spark.shift();
-    if (speed > state.peak) state.peak = speed;
+    if (live.speed > state.peak) state.peak = live.speed;
     if (!ui.root) return;
+    if (tick++ % 4 === 0) applyTheme(pageIsDark() ? 'dark' : 'light');
+    paint(false);
+  }
 
-    ui.dot.style.background = flowing ? '#22c55e' : active ? '#f59e0b' : '#52525b';
-    ui.dot.title = flowing ? '正在输出' : active ? '请求进行中：等待输出或在思考（思考内容不可见）' : '空闲';
-    ui.debugBtn.style.color = debug ? '#f59e0b' : '#a1a1aa';
-    if (ui.body.style.display === 'none') {
-      ui.title.textContent = flowing ? fmtSpeed(speed) + ' tok/s' : active ? '思考中…' : 'Token Meter';
-      return;
+  function paint(force) {
+    const now = performance.now();
+    const { active, flowing, speed } = live;
+    const dotColor = flowing ? STATUS.good : active ? theme.accent : theme.muted;
+    const dotTitle = flowing ? '正在输出' : active ? '请求进行中：等待输出或在思考（思考内容不可见）' : '空闲';
+    for (const d of [ui.dot, ui.pillDot]) {
+      d.style.background = dotColor;
+      d.style.opacity = active && !flowing && tick % 2 ? '0.35' : '1';
+      d.title = dotTitle;
     }
-    ui.title.textContent = 'Token Meter';
-    drawSpark();
-    if (!dirty && !active) return;
+    if (mode === 'full') drawSpark();
+    // 额度重置这类随时间变化的内容，至少 15 秒刷新一次
+    if (!force && !dirty && !active && now - paintedAt < 15000) return;
     dirty = false;
+    paintedAt = now;
+    const r = state.results[state.results.length - 1];
+    const v = { active, flowing, speed, turn: lastTurn(), c: contextNow(), lims: limitViews(), cost: r ? r.cost : 0 };
+    if (mode === 'compact') paintCompact(v);
+    else paintFull(v);
+  }
 
+  function paintCompact(v) {
+    const parts = []; // [文字, 程度]
+    if (v.flowing) parts.push([fmtSpeed(v.speed) + ' tok/s']);
+    else if (v.active) parts.push(['思考中…']);
+    else if (v.turn && v.turn.speed) parts.push([fmtSpeed(v.turn.speed) + ' tok/s']);
+    if (v.c) parts.push([fmt(v.c.used) + (v.c.max ? '/' + fmt(v.c.max) : '')]);
+    for (const l of v.lims) {
+      // 5 小时额度总是显示；其他窗口用到一半以上才显示
+      if (l.name === 'five_hour' || l.used >= 0.5 || l.level !== 'normal') {
+        parts.push([l.short + ' ' + (l.expired ? '已重置' : fmtPct(l.used)), l.level]);
+      }
+    }
+    if (v.cost) parts.push([fmtCost(v.cost, true)]);
+    if (!parts.length) parts.push(['Token Meter']);
+    const key = JSON.stringify(parts);
+    if (key === pillKey) return;
+    pillKey = key;
+    ui.pillText.textContent = '';
+    parts.forEach(([text, level], i) => {
+      if (i) ui.pillText.append(el('span', { color: 'var(--ctm-muted)' }, '·'));
+      const span = el('span', { display: 'inline-flex', alignItems: 'center', gap: '4px' });
+      // 额度偏高时在旁边加个状态色小方块；数字本身一直显示，颜色不单独表达含义
+      if (level && level !== 'normal') span.append(el('span', { width: '7px', height: '7px', borderRadius: '2px', background: STATUS[level] }));
+      span.append(text);
+      ui.pillText.append(span);
+    });
+  }
+
+  function paintFull(v) {
+    const { active, flowing, speed, turn, c, lims, cost } = v;
+    ui.debugBtn.style.color = debug ? 'var(--ctm-accent)' : 'var(--ctm-ink2)';
     ui.speed.textContent = flowing ? fmtSpeed(speed) + ' tok/s' : '–';
     if (active && active.first) {
       const dur = (active.last - active.first) / 1000;
@@ -793,7 +1110,6 @@
     } else ui.cur.textContent = active ? '等待输出…' : '–';
     const lr = state.lastResp;
     ui.last.textContent = lr ? (lr.exact ? '' : '≈') + fmt(lr.tokens) + ' tok · ' + fmtSpeed(lr.speed) + '/s' : '–';
-    const turn = lastTurn();
     ui.turn.textContent = turn ? (turn.speed ? fmtSpeed(turn.speed) + '/s · ' : '') + fmt(turn.tokens) + ' tok' : '–';
     ui.turnRow.title = turn && turn.ms
       ? `上一轮共输出 ${turn.tokens.toLocaleString()} tokens（含思考），API 耗时 ${(turn.ms / 1000).toFixed(1)} 秒。` +
@@ -801,11 +1117,19 @@
       : '上一轮的输出 token 数与平均速度';
     ui.peak.textContent = state.peak ? fmtSpeed(state.peak) + ' tok/s' : '–';
 
-    const c = contextNow();
-    const pct = c && c.max ? (c.used / c.max) * 100 : 0;
-    ui.context.textContent = c ? fmt(c.used) + (c.max ? ' / ' + fmt(c.max) + ' · ' + Math.round(pct) + '%' : '') : '–';
-    ui.bar.style.width = Math.min(100, pct) + '%';
-    ui.bar.style.background = pct >= 80 ? '#f87171' : pct >= 60 ? '#f59e0b' : '#60a5fa';
+    const frac = c && c.max ? c.used / c.max : 0;
+    ui.context.textContent = c ? fmt(c.used) + (c.max ? ' / ' + fmt(c.max) + ' · ' + fmtPct(frac) : '') : '–';
+    setMeter(ui.ctxMeter, frac, levelOf(frac, 0.7, 0.9));
+
+    for (const l of lims) {
+      const r = limitRow(l);
+      r.value.textContent = l.expired ? '已重置' : fmtPct(l.used) + ' · ' + fmtReset(l.resetsAt) + ' 重置';
+      r.row.title = l.expired
+        ? '已过重置时间，下一次请求后显示新窗口的用量'
+        : `还有 ${fmtLeft(l.resetsAt)}重置。数值是这里观察到的最大值，` +
+          '在其他设备或 App 上的用量要等这里下一次请求后才会更新。';
+      setMeter(r.meter, l.used, l.level);
+    }
 
     const t = sessionTotals();
     ui.input.textContent = fmt(t.input);
@@ -813,9 +1137,8 @@
     ui.cacheRead.textContent = fmt(t.cacheRead);
     ui.cacheWrite.textContent = fmt(t.cacheWrite);
     ui.total.textContent = (t.approx ? '≈' : '') + fmt(t.input + t.output + t.cacheRead + t.cacheWrite);
-    const r = state.results[state.results.length - 1];
-    ui.costRow.style.display = r && r.cost ? 'flex' : 'none';
-    ui.cost.textContent = r && r.cost ? '$' + r.cost.toFixed(r.cost >= 10 ? 2 : 4) : '';
+    ui.costRow.style.display = cost ? 'flex' : 'none';
+    ui.cost.textContent = cost ? fmtCost(cost) : '';
   }
 
   function boot() {
@@ -830,8 +1153,12 @@
     get state() {
       return state;
     },
+    get limits() {
+      return limits;
+    },
     totals: sessionTotals,
     context: contextNow,
+    mode: (m) => setMode(m === 'full' ? 'full' : 'compact'),
     reset,
     debug(on = true) {
       debug = !!on;
