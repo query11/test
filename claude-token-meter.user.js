@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.3.1
+// @version      1.3.2
 // @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示 token 用量与生成速度
 // @match        https://claude.ai/*
 // @run-at       document-start
@@ -251,10 +251,11 @@
   function recordReadings(info, ctx) {
     if (!info || typeof info !== 'object') return;
     const windows = windowsOf(info);
+    const ev = state.seq + 1; // 同一个事件里各窗口的读数共用一个编号
     for (const name in windows) {
       const w = windows[name] || {};
       if (!num(w.resetsAt)) continue;
-      const q = { ...stamp(ctx), name, resetsAt: num(w.resetsAt), u: num(w.utilization) };
+      const q = { ...stamp(ctx), name, resetsAt: num(w.resetsAt), u: num(w.utilization), ev };
       state.readings.push(q);
       if (ctx.batch) ctx.batch.push(q);
     }
@@ -646,17 +647,17 @@
     const samples = {};
     for (const key in groups) {
       const name = key.split('@')[0];
-      let prev = null;
+      let prev = null; // [目前为止的最大读数, 段号]
       let step = null;
       for (const [u, c, g] of groups[key]) {
-        // 只有和上一个读数在同一段连续使用里、而且变大了，才是“刚跨过一格”。闲置之后的第一个读数
-        // 可能早就跨过去了（别处用的），不能当起点
+        // 读数偶尔会回落一格再回来（不同请求带回的值不完全一致），所以只有超过之前最大值才算“刚跨过一格”。
+        // 还要和上一个读数在同一段连续使用里：闲置之后的第一个读数可能早就跨过去了（别处用的），不能当起点
         if (prev && prev[1] === g && u > prev[0]) {
           const pts = step && step[2] === g ? Math.round((u - step[0]) * 100) : 0;
           if (pts > 0 && c > step[1]) (samples[name] ||= []).push([(c - step[1]) / pts, pts, step[1], c]);
           step = [u, c, g];
         }
-        prev = [u, g];
+        prev = [prev ? Math.max(prev[0], u) : u, g];
       }
     }
     // 别处的使用表现为“一次跳好几格、本会话却没花多少”，这种段的单价明显低于中位数。它同时影响所有
@@ -675,16 +676,46 @@
       if (points) rates[name] = [kept.reduce((s, [v, w]) => s + v * w, 0) / points, points];
     }
     if (apiCost) rates.sec = [apiSec, apiCost];
+
+    // 两个额度的涨幅之比：同一事件里 5 小时额度和其他额度的读数一起看，同一对窗口内各取首个读数和最大值。
+    // 这和花费无关，别处的使用也会让两者按同样比例上涨，所以闲置期间的数据也能用
+    const events = new Map();
+    for (const q of state.readings) {
+      if (orderKey(q) == null) continue;
+      if (!events.has(q.ev)) events.set(q.ev, { k: orderKey(q) });
+      events.get(q.ev)[q.name] = q;
+    }
+    const spans = {};
+    for (const e of [...events.values()].sort((a, b) => a.k - b.k)) {
+      const f = e.five_hour;
+      if (!f) continue;
+      for (const name in e) {
+        const q = e[name];
+        if (name === 'k' || name === 'five_hour') continue;
+        const key = name + '|' + Math.round(f.resetsAt / 600) + '|' + Math.round(q.resetsAt / 600);
+        const sp = (spans[key] ||= [name, f.u, f.u, q.u, q.u]);
+        sp[2] = Math.max(sp[2], f.u);
+        sp[4] = Math.max(sp[4], q.u);
+      }
+    }
+    const ratio = {};
+    for (const [name, f0, f1, q0, q1] of Object.values(spans)) {
+      const r = (ratio[name] ||= [0, 0]);
+      r[0] += Math.round((f1 - f0) * 100);
+      r[1] += Math.round((q1 - q0) * 100);
+    }
+    for (const name in ratio) if (ratio[name][0] || ratio[name][1]) (rates.ratio ||= {})[name] = ratio[name];
     return rates;
   }
 
   // 每个会话的估算按会话路径存进 localStorage，显示时把最近各会话的结果合起来，
   // 这样换到新会话也能立刻看到，用得越多越准
-  // v2：1.3.0 存的估算没有排除闲置期间别处的使用，可能偏小，直接丢弃
-  const RATE_KEY = 'ctm-rates-v2';
+  // v3：之前版本存的 7 天额度估算会被读数抖动和别处的使用带偏，直接丢弃
+  const RATE_KEY = 'ctm-rates-v3';
   let rateStore = {};
   try {
     localStorage.removeItem('ctm-rates');
+    localStorage.removeItem('ctm-rates-v2');
     rateStore = JSON.parse(lsGet(RATE_KEY) || '{}') || {};
   } catch {}
   let quotaCache = null;
@@ -716,11 +747,18 @@
       lsSet(RATE_KEY, JSON.stringify(rateStore));
     }
     const acc = {};
+    const ratios = {};
     let sec = 0;
     let dollars = 0;
     for (const k in rateStore) {
       const r = (rateStore[k] && rateStore[k].r) || {};
+      for (const name in r.ratio || {}) {
+        const s = (ratios[name] ||= [0, 0]);
+        s[0] += num(r.ratio[name][0]);
+        s[1] += num(r.ratio[name][1]);
+      }
       for (const name in r) {
+        if (name === 'ratio') continue;
         const [a, b] = r[name] || [];
         if (name === 'sec') {
           sec += num(a);
@@ -738,6 +776,19 @@
     for (const name in acc) {
       const a = acc[name];
       out[name] = { perPoint: a.sum / a.dollars, points: a.points, dollars: a.dollars };
+    }
+    // 5 小时以外的额度另有一种算法：5 小时额度的单价 × 两者涨幅之比。它不用分摊花费，闲置期间的数据
+    // 也能用，但 7 天额度涨得慢、取整误差大。两者互相核对：相差不到 40% 时用直接估算（每格更精确），
+    // 差得多说明直接估算被带偏了（7 天额度每格要好几美元，一个会话里只有两三个样本），改用比例法
+    const five = out.five_hour;
+    for (const name in ratios) {
+      const [d5, dn] = ratios[name];
+      if (!five || dn < 3 || !d5) continue;
+      const viaRatio = (five.perPoint * d5) / dn;
+      const direct = out[name];
+      if (!direct || direct.perPoint < viaRatio / 1.4 || direct.perPoint > viaRatio * 1.4) {
+        out[name] = { perPoint: viaRatio, points: dn, ratio: d5 / dn };
+      }
     }
     if (sec > 0 && dollars > 0) out.secPerDollar = sec / dollars;
     return (quotaCache = out);
@@ -1399,7 +1450,10 @@
         const hours = rates.secPerDollar ? (left * rates.secPerDollar) / 3600 : null;
         r.est.textContent = l.used >= 1 ? '已用完' : '约剩 ' + fmtUsd(left) + (hours == null ? '' : ' · ' + fmtHours(hours));
         r.est.title =
-          `按 API 标价折算，整个 ${l.label}约 ${fmtUsd(full)}（每 1% ≈ ${fmtUsd(q.perPoint, true)}，依据 ${q.points} 个百分点、${fmtUsd(q.dollars)} 的花费）` +
+          `按 API 标价折算，整个 ${l.label}约 ${fmtUsd(full)}（每 1% ≈ ${fmtUsd(q.perPoint, true)}` +
+          (q.ratio
+            ? `：5 小时额度每 1% ≈ ${fmtUsd(rates.five_hour.perPoint, true)}，这项额度每涨 1%，5 小时额度大约涨 ${q.ratio.toFixed(1)}%，依据 ${q.points} 个百分点的变化）`
+            : `，依据 ${q.points} 个百分点、${fmtUsd(q.dollars)} 的花费）`) +
           (rates.secPerDollar ? `；按你最近的用法，模型每运行 1 小时约花 ${fmtUsd(3600 / rates.secPerDollar)}` : '') +
           '。只是估算：假设统计期间账号没有别处的使用；换模型或用法差别很大时会不准。';
       } else {
