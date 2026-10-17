@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Linux DO 楼中楼阅读
 // @namespace    local.linuxdo.threaded-reading
-// @version      4.4.1
+// @version      4.5.0
 // @description  楼中楼递进连线、引用切换、阅读进度和新回复定位，保留原生操作。
 // @match        https://linux.do/*
 // @run-at       document-idle
@@ -17,7 +17,8 @@
 
   GM_addStyle(`
     .post-stream.ldt-thread { display: flex; flex-direction: column; overflow-anchor: none; }
-    .post-stream.ldt-thread > [data-post-number]:not([data-post-number="1"]):not([data-ldt-depth]) { order: 1000000; }
+    .post-stream.ldt-thread > [data-post-number]:not([data-post-number="1"]):not([data-ldt-depth]),
+    .post-stream.ldt-thread > :not([data-post-number]):not([data-ldt-rank]):not(.ldt-modebar):not(.ldt-connectors) { order: 1000000; }
     .post-stream.ldt-thread > .ldt-modebar { order: 1; }
     .post-stream.ldt-active .embedded-posts,
     .post-stream.ldt-active .show-replies,
@@ -168,7 +169,7 @@
     .ldt-modes .btn:focus-visible { outline: 2px solid var(--tertiary, #3979a3); outline-offset: 4px; border-radius: 2px; }
     .topic-map__stats:has(> .ldt-modebar) .topic-map__users-list { min-width: 0; overflow: hidden; }
     .post-stream > .ldt-modebar { justify-content: flex-end; margin: 0; padding: 4px 0; }
-    [data-ldt-native-progress] { display: none !important; }
+    html[data-ldt-progress] .timeline-scrollarea:not(.timeline-fullscreen *) { display: none !important; }
     .ldt-reading-progress { display: flex; flex-direction: column; gap: 8px; height: 300px; width: 140px; max-width: 100%; }
     .ldt-progress-caption, .ldt-progress-total { font-size: 12px; line-height: 1.5; color: var(--primary-medium, #777); }
     .ldt-progress-total { font-size: 11px; }
@@ -177,9 +178,9 @@
     .ldt-progress-fill { position: absolute; left: 8px; top: 10px; width: 2px; height: calc((100% - 20px) * var(--ldt-progress, 0)); background: var(--tertiary, #3979a3); }
     .ldt-progress-handle { position: absolute; left: 6px; top: calc((100% - 20px) * var(--ldt-progress, 0)); width: 6px; height: 20px; border-radius: 4px; background: var(--tertiary, #3979a3); }
     .ldt-progress-percent { position: absolute; left: 23px; top: calc((100% - 20px) * var(--ldt-progress, 0)); font-size: 16px; font-weight: 600; line-height: 20px; color: var(--primary, #333); }
-    #topic-progress[data-ldt-mobile-progress] { display: flex; align-items: center; justify-content: center; box-sizing: border-box; height: auto; min-height: 40px; padding: 4px 10px; border: 1px solid var(--primary-low, #ddd); border-radius: 6px; background: var(--secondary, #fff); }
-    #topic-progress[data-ldt-mobile-progress] > .nums,
-    #topic-progress[data-ldt-mobile-progress] > .bg { display: none !important; }
+    html[data-ldt-progress] #topic-progress { display: flex; align-items: center; justify-content: center; box-sizing: border-box; height: auto; min-height: 40px; padding: 4px 10px; border: 1px solid var(--primary-low, #ddd); border-radius: 6px; background: var(--secondary, #fff); }
+    html[data-ldt-progress] #topic-progress > .nums,
+    html[data-ldt-progress] #topic-progress > .bg { display: none !important; }
     .ldt-progress-navigation { display: block; margin-bottom: 6px; color: var(--primary-medium, #777); font-size: 12px; }
     .ldt-progress-mobile { display: block; color: var(--primary, #333); font-size: 12px; font-weight: 600; line-height: 1.5; white-space: nowrap; }
     .ldt-progress-rail:focus-visible { outline: 2px solid var(--tertiary, #3979a3); outline-offset: 3px; border-radius: 4px; }
@@ -213,11 +214,42 @@
   let state;
   let timer;
   let progressFrame;
+  let frameLayout = false;
+  let connected = new WeakSet();
+  const stuckNodes = new Set();
+  const connectorLinks = new WeakMap();
+  let avatarCache = new WeakMap();
+  const avatarKinds = new Map();
+  let viewportWidth = window.innerWidth;
+  // 脚本自己插入的节点：新增的不必理会；正文里的标注若被别人删掉（例如论坛重绘），要重新补上。
+  const UI = '.ldt-connectors, .ldt-updates, .ldt-reading-progress, .ldt-progress-navigation, .ldt-progress-mobile';
+  const OWN = `${UI}, .ldt-modebar, .ldt-relation, .ldt-sidepeek-relation, .ldt-owner-label, .ldt-auto-quote`;
+  const is = (node, selector) => node.nodeType === 1 && node.matches(selector);
+  const foreign = r => !r.target.closest?.(OWN) && (r.type !== 'childList' || [...r.addedNodes].some(n => !is(n, OWN)) || [...r.removedNodes].some(n => !is(n, UI)));
+  // 论坛滚动时会折叠、恢复远处楼层并重新渲染内容。回调在同一帧绘制前执行，直接补回整理结果，不留原样闪一下的空档。
   const observer = new MutationObserver(records => {
-    if (records.some(r => !r.target.closest?.('.ldt-connectors') && (r.type !== 'childList' || [...r.addedNodes, ...r.removedNodes].some(n => !n.classList?.contains('ldt-connectors'))))) schedule();
+    let layout = false, progress = false, any = false;
+    for (const r of records) {
+      if (!foreign(r)) continue;
+      any = true;
+      const t = r.target;
+      if (state && (state.stream.contains(t) || t === state.stream.parentElement) || t.closest?.('#ld-drawer-root')
+        || (t === document.body && [...r.addedNodes].some(n => n.id === 'ld-drawer-root'))) { layout = true; break; }
+      if (t.closest?.('.timeline-container, #topic-progress-wrapper, #topic-progress')) progress = true;
+    }
+    if (!any) return;
+    const id = enabled ? topicId() : 0;
+    const stream = id ? document.querySelector('.post-stream') : null;
+    if (layout || stream !== (state?.stream || null) || (state && state.id !== id)) refresh();
+    else if (progress && state) updateProgress(state);
   });
   const connectorTargets = new Set();
-  const connectorResize = typeof ResizeObserver === 'function' ? new ResizeObserver(scheduleProgress) : null;
+  // 尺寸变化在布局之后、绘制之前回调，连线和阅读位置当帧更新。
+  const connectorResize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => {
+    if (state) settle(state);
+    updateConnectors();
+    scheduleProgress();
+  }) : null;
   function watchConnectors(node) {
     if (!connectorResize || connectorTargets.has(node)) return;
     connectorTargets.add(node);
@@ -329,6 +361,23 @@
       .sort((a, b) => a.rect.top - b.rect.top)[0]?.node;
   }
 
+  // 记下当前画面最上方的楼层；之后无论论坛重绘还是本脚本调整，都以它为准保持阅读位置。
+  function settle(s) {
+    const header = headerBottom();
+    let node = s.settled?.node;
+    let rect = node?.isConnected ? node.getBoundingClientRect() : null;
+    if (!rect?.height || rect.bottom <= header || rect.top > header + 1) {
+      node = readingAnchor(s);
+      rect = node?.getBoundingClientRect();
+    }
+    s.settled = node ? { node, top: rect.top, scrollY: window.scrollY } : null;
+  }
+
+  function setData(node, key, value) {
+    if (value === null) { if (key in node.dataset) delete node.dataset[key]; }
+    else if (node.dataset[key] !== value) node.dataset[key] = value;
+  }
+
   function renderedPost(s, number) {
     const node = s.stream.querySelector(`:scope > [data-post-number="${number}"]`);
     return node && !node.classList.contains('post-stream--cloaked') && node.querySelector(':scope > article') ? node : null;
@@ -409,7 +458,7 @@
       }
       for (const card of view.querySelectorAll('.ld-inline-post:not(.ld-parent-preview *)')) {
         const parent = card.parentElement.closest('.ld-post-card, .ld-inline-post');
-        card.dataset.ldtLevel = Math.min(3, Number(parent?.dataset.ldtLevel || 0) + 1);
+        setData(card, 'ldtLevel', String(Math.min(3, Number(parent?.dataset.ldtLevel || 0) + 1)));
         const row = card.querySelector(':scope > .ld-post-header .ld-post-author-row');
         const author = parent?.querySelector(':scope > .ld-post-header .ld-post-author-row > strong')?.textContent?.trim();
         if (!row || !author) continue;
@@ -417,6 +466,7 @@
         if (!relation) {
           relation = element('button', 'ldt-sidepeek-relation');
           relation.type = 'button';
+          relation.title = '定位被回复的评论';
           relation.addEventListener('click', () => {
             const scroller = view.closest('.ld-drawer-body');
             if (scroller) scroller.scrollTo({ top: scroller.scrollTop + parent.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 12, behavior: 'auto' });
@@ -427,35 +477,79 @@
         }
         const label = `回复 ${author}`;
         if (relation.textContent !== label) relation.textContent = label;
-        relation.title = '定位被回复的评论';
       }
     }
   }
 
+  // 被论坛折叠的楼层没有头像，沿用它展开时在楼层里的原位（吸顶时不记），线条不会随滚动断开又出现；
+  // 从没展开过的按同一层级的推算，同层头像位置相同。
+  function avatarBox(node, selector, origin, header) {
+    const rect = node.getBoundingClientRect();
+    if (!rect.height) return null;
+    const img = node.classList.contains('post-stream--cloaked') ? null : node.querySelector(selector);
+    const avatar = img?.getBoundingClientRect();
+    const kind = node.dataset.ldtDepth === undefined ? null : Math.min(3, Number(node.dataset.ldtDepth));
+    let box = avatarCache.get(node);
+    if (avatar?.width) {
+      const y = avatar.top - rect.top;
+      box = { x: avatar.left - origin.left, y: !box || y <= box.y || rect.top > header + 60 ? y : box.y, width: avatar.width, height: avatar.height };
+      avatarCache.set(node, box);
+      if (kind !== null) avatarKinds.set(kind, { ...box, y: Math.min(box.y, avatarKinds.get(kind)?.y ?? Infinity) });
+      // 吸顶的头像按当前位置连线，记下来让滚动时跟着重画。
+      if (rect.top < header + 60 && rect.bottom > header && getComputedStyle(img.closest('.topic-avatar') || img).position === 'sticky') stuckNodes.add(node);
+      const top = rect.top - origin.top + y;
+      return { left: box.x, top, width: box.width, height: box.height, bottom: top + box.height };
+    }
+    if (kind !== null && avatarKinds.has(kind)) box = avatarKinds.get(kind);
+    if (!box) return null;
+    const top = rect.top - origin.top + box.y;
+    return { left: box.x, top, width: box.width, height: box.height, bottom: top + box.height };
+  }
+
+  function avatarBoxes(container, selector) {
+    const origin = container.getBoundingClientRect();
+    const header = headerBottom();
+    const boxes = new Map();
+    return node => {
+      if (!boxes.has(node)) boxes.set(node, node ? avatarBox(node, selector, origin, header) : null);
+      return boxes.get(node);
+    };
+  }
+
+  function route(p, c) {
+    if (!p || !c || c.top <= p.top) return null;
+    const round = value => Math.round(value * 2) / 2;
+    const x = round(c.left - 4), y = round(c.top + c.height / 2);
+    const nested = c.left > p.left + 3;
+    const center = round(p.left + p.width / 2);
+    const lane = nested ? Math.min(center, x - 8) : x - 8;
+    const start = nested ? `M ${center} ${round(p.bottom + 5)} H ${lane}` : `M ${round(p.left - 4)} ${round(p.top + p.height / 2)} H ${lane}`;
+    return `${start} V ${y - 8} Q ${lane} ${y} ${lane + 8} ${y} H ${x}`;
+  }
+
   function connectReplies(container, pairs, avatarSelector) {
     const old = container.querySelector(':scope > .ldt-connectors');
-    const origin = container.getBoundingClientRect();
+    const box = avatarBoxes(container, avatarSelector);
     const paths = [];
+    const links = new Map();
     for (const [parent, child, number] of pairs) {
-      if (!parent || parent.classList.contains('post-stream--cloaked') || child.classList.contains('post-stream--cloaked')) continue;
-      const p = parent.querySelector(avatarSelector)?.getBoundingClientRect();
-      const c = child.querySelector(avatarSelector)?.getBoundingClientRect();
-      if (!p?.width || !c?.width || c.top <= p.top) continue;
-      const x = c.left - origin.left - 4, y = c.top - origin.top + c.height / 2;
-      const nested = c.left > p.left + 3;
-      const lane = nested ? Math.min(p.left - origin.left + p.width / 2, x - 8) : x - 8;
-      const startY = nested ? p.bottom - origin.top + 5 : p.top - origin.top + p.height / 2;
-      const start = nested ? `M ${p.left - origin.left + p.width / 2} ${startY} H ${lane}` : `M ${p.left - origin.left - 4} ${startY} H ${lane}`;
-      paths.push(`<path data-ldt-child="${number}" d="${start} V ${y - 8} Q ${lane} ${y} ${lane + 8} ${y} H ${x}"/>`);
+      const d = route(box(parent), box(child));
+      if (!d) continue;
+      links.set(String(number), [parent, child]);
+      connected.add(parent).add(child);
+      paths.push(`<path data-ldt-child="${number}" d="${d}"/>`);
     }
     const html = paths.join('');
     if (!html) { old?.remove(); return; }
     const svg = old || document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     if (!old) { svg.classList.add('ldt-connectors'); svg.setAttribute('aria-hidden', 'true'); container.append(svg); }
     if (svg.innerHTML !== html) svg.innerHTML = html;
+    connectorLinks.set(svg, { links, selector: avatarSelector });
   }
 
   function updateConnectors() {
+    stuckNodes.clear();
+    connected = new WeakSet();
     if (state) {
       const { stream, posts } = state;
       const nodes = new Map([...stream.querySelectorAll(':scope > [data-post-number]')].map(n => [Number(n.dataset.postNumber), n]));
@@ -464,6 +558,22 @@
     }
     for (const view of document.querySelectorAll('#ld-drawer-root [data-ldt-sidepeek]')) {
       connectReplies(view, [...view.querySelectorAll('.ld-inline-post:not(.ld-parent-preview *)')].map(child => [child.parentElement.closest('.ld-post-card, .ld-inline-post'), child, child.dataset.threadPostNumber]), ':scope > .ld-post-header .ld-post-avatar');
+    }
+  }
+
+  // 头像吸顶时只重画连着这几层楼的线。
+  function followSticky(nodes) {
+    const svg = state?.stream.querySelector(':scope > .ldt-connectors');
+    const record = svg && connectorLinks.get(svg);
+    if (!record) return;
+    stuckNodes.clear();
+    const box = avatarBoxes(state.stream, record.selector);
+    for (const path of svg.children) {
+      const link = record.links.get(path.dataset.ldtChild);
+      if (!link || (!nodes.has(link[0]) && !nodes.has(link[1]))) continue;
+      const d = route(box(link[0]), box(link[1]));
+      if (!d) { updateConnectors(); return; }
+      if (path.getAttribute('d') !== d) path.setAttribute('d', d);
     }
   }
 
@@ -487,7 +597,8 @@
     if (mode !== 'quote' || !post?.parent || authored) { owned?.remove(); return; }
     const parent = s.posts.get(post.parent);
     if (!parent?.cooked) { owned?.remove(); load(s, post.parent); return; }
-    const text = quoteText(parent.cooked);
+    if (!s.quotes.has(parent.cooked)) s.quotes.set(parent.cooked, quoteText(parent.cooked));
+    const text = s.quotes.get(parent.cooked);
     if (!text) { owned?.remove(); return; }
     const signature = JSON.stringify([post.parent, parent.author, text]);
     if (owned?.dataset.signature === signature) return;
@@ -532,17 +643,18 @@
     s.mobileProgress = null;
     s.navigationNote?.remove();
     s.navigationNote = null;
-    document.querySelectorAll('[data-ldt-native-progress], [data-ldt-mobile-progress]').forEach(n => { delete n.dataset.ldtNativeProgress; delete n.dataset.ldtMobileProgress; });
+    setData(document.documentElement, 'ldtProgress', null);
   }
 
   function updateProgress(s) {
     updateUnread(s);
     if (mode !== 'thread') { clearProgress(s); return; }
+    // 用根节点标记隐藏原生进度条，论坛重建时间线时也不会先露出原样。
+    setData(document.documentElement, 'ldtProgress', '');
     const candidate = document.querySelector('.timeline-scrollarea');
     const fullscreen = candidate?.closest('.timeline-fullscreen');
     const native = fullscreen ? null : candidate;
     if (fullscreen) {
-      delete candidate.dataset.ldtNativeProgress;
       if (!s.navigationNote) s.navigationNote = element('span', 'ldt-progress-navigation', '原楼号导航 · 含回复');
       if (candidate.previousElementSibling !== s.navigationNote) candidate.before(s.navigationNote);
     } else s.navigationNote?.remove();
@@ -582,9 +694,9 @@
       s.progress = panel;
     }
     if (native) {
-      native.dataset.ldtNativeProgress = '';
       if (native.nextElementSibling !== s.progress) native.after(s.progress);
-      s.progress.style.height = native.style.height || '300px';
+      const height = native.style.height || '300px';
+      if (s.progress.style.height !== height) s.progress.style.height = height;
     }
     const rect = s.stream.getBoundingClientRect();
     const header = headerBottom();
@@ -607,17 +719,39 @@
     }
     if (mobile) {
       if (!s.mobileProgress) s.mobileProgress = element('span', 'ldt-progress-mobile');
-      mobile.dataset.ldtMobileProgress = '';
       if (s.mobileProgress.parentElement !== mobile) mobile.append(s.mobileProgress);
       const text = `${partial ? '本段' : '阅读'} ${percent}% · ${partial && s.total ? `${loaded}/${s.total}` : s.total || loaded}帖`;
       if (s.mobileProgress.textContent !== text) s.mobileProgress.textContent = text;
-      s.mobileProgress.title = `${partial ? '当前阅读段' : '阅读进度'}，${count}`;
+      const title = `${partial ? '当前阅读段' : '阅读进度'}，${count}`;
+      if (s.mobileProgress.title !== title) s.mobileProgress.title = title;
     }
   }
 
+  // 单纯滚动只更新进度；连线相对评论区固定，只在内容或尺寸变化、或连线的头像吸顶时重画。
   function scheduleProgress() {
     if (progressFrame) return;
-    progressFrame = requestAnimationFrame(() => { progressFrame = 0; if (state) updateProgress(state); updateConnectors(); });
+    progressFrame = requestAnimationFrame(() => {
+      progressFrame = 0;
+      const layout = frameLayout;
+      frameLayout = false;
+      if (state) settle(state);
+      if (layout) updateConnectors();
+      else if (state && (stuckNodes.size || stuckAtTop(state))) followSticky(new Set([...stuckNodes, state.settled?.node]));
+      if (state) updateProgress(state);
+    });
+  }
+
+  // 头像只会吸附在跨过顶栏的那层楼里；它连着线时，滚动要跟着重画。
+  function stuckAtTop(s) {
+    const node = s.settled?.node;
+    if (mode !== 'thread' || !node || s.settled.top >= headerBottom() || !connected.has(node)) return false;
+    const avatar = node.querySelector(':scope > .boxed > .row > .topic-avatar');
+    return !!avatar && getComputedStyle(avatar).position === 'sticky';
+  }
+
+  function scheduleLayout() {
+    frameLayout = true;
+    scheduleProgress();
   }
 
   function cleanup() {
@@ -644,51 +778,66 @@
   }
 
   function refresh() {
+    clearTimeout(timer);
     observer.disconnect();
+    try { arrange(); } finally { observe(); }
+  }
+
+  function arrange() {
     updateSidepeek();
     const id = topicId();
     const stream = document.querySelector('.post-stream');
-    if (!enabled || !id || !stream) { cleanup(); updateConnectors(); observe(); return; }
-    if (state?.id !== id || state.stream !== stream) {
+    if (!enabled || !id || !stream) { cleanup(); updateConnectors(); return; }
+    const created = state?.id !== id || state?.stream !== stream;
+    if (created) {
       cleanup();
-      state = { id, stream, posts: new Map(), requested: new Set(), abort: new AbortController(), queue: Promise.resolve(), nextRequest: 0 };
+      state = { id, stream, posts: new Map(), quotes: new Map(), requested: new Set(), abort: new AbortController(), queue: Promise.resolve(), nextRequest: 0 };
       state.bar = modebar(state);
       state.style = element('style', 'ldt-layout');
       document.head.append(state.style);
     }
     const s = state;
     watchConnectors(stream);
-    const anchor = readingAnchor(s);
-    const anchorTop = anchor?.getBoundingClientRect().top;
+    // 此刻论坛可能已改动但还没绘制，按上一帧画面里的位置找回阅读点；页面被程序滚动过时退回当前测量。
+    let anchor = s.settled?.node, anchorTop = s.settled?.top;
+    if (!anchor?.isConnected || s.settled.scrollY !== window.scrollY) {
+      anchor = readingAnchor(s);
+      anchorTop = anchor?.getBoundingClientRect().top;
+    }
     if (!snapshot(s) && !s.posts.size) load(s);
     syncUpdates(s);
     const wrappers = [...stream.children].filter(n => Number(n.dataset.postNumber) > 0);
+    const byNumber = new Map(wrappers.map(n => [Number(n.dataset.postNumber), n]));
     const positions = layout(s, wrappers);
     stream.classList.add('ldt-active');
     stream.classList.toggle('ldt-thread', mode === 'thread');
-    const op = wrappers.find(n => Number(n.dataset.postNumber) === 1);
+    const op = byNumber.get(1);
     const stats = op?.querySelector('.topic-map__stats');
-    if (stats && s.bar.parentElement !== stats) stats.append(s.bar);
-    else if (!stats && op && op.nextElementSibling !== s.bar) op.after(s.bar);
-    else if (!stats && !op && stream.firstElementChild !== s.bar) stream.prepend(s.bar);
-    s.bar.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.mode === mode)));
+    // 首楼被折叠时切换栏跟着收起，不挪进评论流，免得每次折叠、展开都改变页面高度。
+    if (stats) { if (s.bar.parentElement !== stats) stats.append(s.bar); }
+    else if (op) { if (!op.classList.contains('post-stream--cloaked') && op.nextElementSibling !== s.bar) op.after(s.bar); }
+    else if (stream.firstElementChild !== s.bar) stream.prepend(s.bar);
+    for (const b of s.bar.querySelectorAll('button')) {
+      const pressed = String(b.dataset.mode === mode);
+      if (b.getAttribute('aria-pressed') !== pressed) b.setAttribute('aria-pressed', pressed);
+    }
     const rules = [];
     const branches = new Map();
+    const marks = new Map();
     for (const wrapper of wrappers) {
       const number = Number(wrapper.dataset.postNumber);
       if (number === 1) continue;
       const post = s.posts.get(number);
       const position = positions.get(number);
-      wrapper.dataset.ldtDepth = position.depth;
+      setData(wrapper, 'ldtDepth', String(position.depth));
       rules.push(`.post-stream.ldt-thread > [data-post-number="${number}"] { order: ${position.rank}; --ldt-indent: ${Math.min(2, Math.max(0, position.depth - 1))}; }`);
-      delete wrapper.dataset.ldtFirst;
-      delete wrapper.dataset.ldtLast;
-      delete wrapper.dataset.ldtRoot;
-      delete wrapper.dataset.ldtConnected;
+      marks.set(wrapper, { ldtFirst: false, ldtLast: false, ldtRoot: false, ldtConnected: false });
       if (position.depth > 0) {
         if (!branches.has(position.root)) branches.set(position.root, []);
         branches.get(position.root).push(wrapper);
       }
+      // 折叠的楼层没有内容，展开时会再次触发整理。
+      if (wrapper.classList.contains('post-stream--cloaked')) continue;
       const names = [...wrapper.querySelectorAll('.topic-body > .topic-meta-data .names')]
         .find(n => !n.closest('.embedded-posts'));
       let badge = names?.querySelector('.ldt-owner-label');
@@ -716,40 +865,52 @@
       updateQuote(s, wrapper, post);
     }
     for (const [root, replies] of branches) {
-      const parent = wrappers.find(n => Number(n.dataset.postNumber) === root);
-      if (parent && !parent.classList.contains('post-stream--cloaked')) parent.dataset.ldtRoot = '';
+      const parent = byNumber.get(root);
+      if (marks.has(parent)) marks.get(parent).ldtRoot = true;
       replies.sort((a, b) => positions.get(Number(a.dataset.postNumber)).rank - positions.get(Number(b.dataset.postNumber)).rank);
-      replies[0].dataset.ldtFirst = '';
-      if (parent && !parent.classList.contains('post-stream--cloaked')) replies[0].dataset.ldtConnected = '';
-      replies.at(-1).dataset.ldtLast = '';
+      marks.get(replies[0]).ldtFirst = true;
+      marks.get(replies[0]).ldtConnected = !!parent;
+      marks.get(replies.at(-1)).ldtLast = true;
     }
+    // 只改有变化的标记，楼层折叠与否不影响标记，展开时样式立即就位。
+    for (const [wrapper, flags] of marks) for (const key in flags) setData(wrapper, key, flags[key] ? '' : null);
     // 原生加载边界、时间分隔线仍跟随对应楼层，不参与回复关系排序。
     const children = [...stream.children];
     children.forEach((node, i) => {
       if (node === s.bar || node.dataset.postNumber || node.classList.contains('ldt-connectors')) return;
       const next = children.slice(i + 1).find(n => Number(n.dataset.postNumber) > 0);
-      node.dataset.ldtRank = i;
+      setData(node, 'ldtRank', String(i));
       const rank = next ? (positions.get(Number(next.dataset.postNumber))?.rank || 0) - 1 : (positions.size + 3) * 10;
       rules.push(`.post-stream.ldt-thread > [data-ldt-rank="${i}"] { order: ${rank}; }`);
     });
     const css = rules.join('\n');
     if (s.style.textContent !== css) s.style.textContent = css;
-    if (anchor && anchorTop !== undefined) {
+    if (anchor?.isConnected && anchorTop !== undefined) {
       const delta = anchor.getBoundingClientRect().top - anchorTop;
       if (Math.abs(delta) > 1) window.scrollBy(0, delta);
     }
-    updateProgress(s);
+    // 先读完位置再写连线；进度面板不影响正文，放到下一帧。
+    settle(s);
     updateConnectors();
-    observe();
+    if (created) updateProgress(s);
+    else scheduleProgress();
   }
 
   function schedule() { clearTimeout(timer); timer = setTimeout(refresh, 80); }
   if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('开启 / 关闭评论整理', () => { enabled = !enabled; refresh(); });
   window.addEventListener('popstate', schedule);
-  window.addEventListener('scroll', scheduleProgress, { passive: true });
-  window.addEventListener('resize', scheduleProgress);
+  // 滚动事件早于论坛在这一帧里的重绘，先把记下的阅读位置跟着平移。
+  window.addEventListener('scroll', () => {
+    const settled = state?.settled;
+    if (settled) { settled.top -= window.scrollY - settled.scrollY; settled.scrollY = window.scrollY; }
+    scheduleProgress();
+  }, { passive: true });
+  window.addEventListener('resize', () => {
+    if (window.innerWidth !== viewportWidth) { viewportWidth = window.innerWidth; avatarCache = new WeakMap(); avatarKinds.clear(); }
+    scheduleLayout();
+  });
   document.addEventListener('visibilitychange', scheduleProgress);
-  document.addEventListener('load', scheduleProgress, true);
+  document.addEventListener('load', scheduleLayout, true);
   document.addEventListener('scroll', scheduleProgress, { passive: true, capture: true });
   document.addEventListener('click', event => {
     if (!state || mode !== 'thread' || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
