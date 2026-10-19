@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Linux DO 楼中楼阅读
 // @namespace    local.linuxdo.threaded-reading
-// @version      4.5.0
+// @version      4.6.0
 // @description  楼中楼递进连线、引用切换、阅读进度和新回复定位，保留原生操作。
 // @match        https://linux.do/*
 // @run-at       document-idle
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_listValues
+// @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
 // ==/UserScript==
@@ -221,6 +223,8 @@
   let avatarCache = new WeakMap();
   const avatarKinds = new Map();
   let viewportWidth = window.innerWidth;
+  // 新回复记录最多保留的帖子数和天数。
+  const UPDATE_KEEP = 300, UPDATE_DAYS = 30;
   // 脚本自己插入的节点：新增的不必理会；正文里的标注若被别人删掉（例如论坛重绘），要重新补上。
   const UI = '.ldt-connectors, .ldt-updates, .ldt-reading-progress, .ldt-progress-navigation, .ldt-progress-mobile';
   const OWN = `${UI}, .ldt-modebar, .ldt-relation, .ldt-sidepeek-relation, .ldt-owner-label, .ldt-auto-quote`;
@@ -383,9 +387,19 @@
     return node && !node.classList.contains('post-stream--cloaked') && node.querySelector(':scope > article') ? node : null;
   }
 
+  // 和点帖子里的楼层链接一样交给论坛站内跳转，只加载那一段，不整页刷新；论坛没接管时浏览器照常打开链接。
+  function routeTo(href) {
+    const link = element('a', 'ldt-route');
+    link.href = href;
+    link.hidden = true;
+    (document.querySelector('#main') || document.body).append(link);
+    link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    link.remove();
+  }
+
   function jumpToPost(s, number) {
     const node = renderedPost(s, number);
-    if (!node) { location.assign(`/t/topic/${s.id}/${number}`); return; }
+    if (!node) { routeTo(`/t/topic/${s.id}/${number}`); return; }
     window.scrollTo({ top: Math.max(0, node.getBoundingClientRect().top + window.scrollY - headerBottom() - 12), behavior: 'auto' });
     node.classList.remove('ldt-focus');
     requestAnimationFrame(() => node.classList.add('ldt-focus'));
@@ -408,6 +422,27 @@
     s.lastKnown = Math.max(s.lastKnown, highest);
   }
 
+  // 新回复记录只留最近看过的，免得越积越多：油猴每次打开页面都会把存储整体载入。每天清理一次。
+  function pruneUpdates() {
+    if (typeof GM_listValues !== 'function' || typeof GM_deleteValue !== 'function') return;
+    const now = Date.now();
+    if (now - (Number(GM_getValue('topic-updates-pruned-at', 0)) || 0) < 864e5) return;
+    GM_setValue('topic-updates-pruned-at', now);
+    const entries = [];
+    for (const key of GM_listValues()) {
+      if (!key.startsWith('topic-updates:')) continue;
+      const value = GM_getValue(key, null);
+      if (!value || typeof value !== 'object') { GM_deleteValue(key); continue; }
+      entries.push({ key, value, at: Number(value.at) || 0 });
+    }
+    // 旧版本存的记录没有时间，排在最后，留下的从现在起算。
+    entries.sort((a, b) => b.at - a.at);
+    entries.forEach(({ key, value, at }, i) => {
+      if (i >= UPDATE_KEEP || (at && now - at > UPDATE_DAYS * 864e5)) GM_deleteValue(key);
+      else if (!at) GM_setValue(key, { ...value, at: now });
+    });
+  }
+
   function updateUnread(s) {
     if (!s.updates) return;
     const rendered = new Map([...s.stream.children].map(node => [Number(node.dataset.postNumber), node]));
@@ -424,7 +459,7 @@
     const saved = JSON.stringify({ highest: s.lastKnown, since: s.since, pending: [...s.updates], seen: [...s.seenNew] });
     if (s.savedUpdates !== saved) {
       s.savedUpdates = saved;
-      if (typeof GM_setValue === 'function') GM_setValue(`topic-updates:${s.id}`, JSON.parse(saved));
+      if (typeof GM_setValue === 'function') GM_setValue(`topic-updates:${s.id}`, { ...JSON.parse(saved), at: Date.now() });
     }
     if (mode !== 'thread' || !s.updates.size) { s.notice?.remove(); s.notice = null; return; }
     if (!s.notice) {
@@ -577,9 +612,9 @@
     }
   }
 
+  // 在不加载资源的独立文档里解析，被回复楼层里的图片不会被下载。
   function quoteText(cooked) {
-    const body = document.createElement('div');
-    body.innerHTML = cooked;
+    const body = new DOMParser().parseFromString(cooked, 'text/html').body;
     body.querySelectorAll('aside.quote, script, style, iframe').forEach(n => n.remove());
     body.querySelectorAll('br').forEach(n => n.replaceWith('\n'));
     body.querySelectorAll('p, li, pre, h1, h2, h3, h4, h5, h6').forEach(n => n.append('\n'));
@@ -920,9 +955,10 @@
     event.stopImmediatePropagation();
     const first = date.classList.contains('start-date');
     const number = first ? 1 : Number(new URL(date.href, location.href).pathname.split('/').filter(Boolean).at(-1));
-    if (!renderedPost(state, number)) location.assign(first ? `/t/topic/${state.id}/1` : date.href);
+    if (!renderedPost(state, number)) routeTo(first ? `/t/topic/${state.id}/1` : date.href);
     else window.scrollTo({ top: first ? 0 : state.progressStart + state.progressRange, behavior: 'auto' });
   }, true);
   setInterval(() => { if (enabled && topicId() !== (state?.id || 0)) schedule(); }, 1000);
+  setTimeout(pruneUpdates, 5000);
   refresh();
 })();
