@@ -1,8 +1,11 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.4.0
-// @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示模型、推理强度、token 用量、生成速度与订阅额度
+// @version      1.5.0
+// @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示模型、推理强度、token 用量、生成速度、提示缓存与订阅额度
+// @homepageURL  https://github.com/query11/test
+// @downloadURL  https://raw.githubusercontent.com/query11/test/HEAD/claude-token-meter.user.js
+// @updateURL    https://raw.githubusercontent.com/query11/test/HEAD/claude-token-meter.user.js
 // @match        https://claude.ai/*
 // @run-at       document-start
 // @grant        none
@@ -34,7 +37,7 @@
   const W = window;
   if (W.__ctm) return;
 
-  const VERSION = '1.4.0';
+  const VERSION = '1.5.0';
   const FLOW_MS = 1500; // 这么久内收到过 token 视为“正在输出”
   const STALE_MS = 60000; // 流式请求这么久没动静就当作已结束（防止漏掉 message_stop）
   const SPEED_WINDOW_MS = 2000; // 实时速度的滑动窗口
@@ -75,6 +78,7 @@
       messages: new Map(), // message id -> 见 messageRecord()
       results: [], // result 快照，按先后排序
       resets: [], // /clear（conversation_reset）发生的位置：累计值从这里重新开始
+      compacts: [], // 上下文压缩（compact_boundary）发生的位置：之后的缓存是重新建的
       readings: [], // 本会话收到的额度读数，用来估算额度折合多少钱
       info: {}, // 模型、推理强度、上下文读数等线索：项目 -> [记录]，用的时候取最新的一条
       metaSeen: {}, // 会话元数据里各项上一次的值
@@ -149,6 +153,8 @@
         output: 0,
         cacheRead: 0,
         cacheWrite: 0,
+        ttl: '', // 这次请求写入的缓存是 5 分钟（'5m'）还是 1 小时（'1h'）的
+        fast: false, // 快速模式
         exact: false, // output 是否来自 message_delta 的精确值
         streamEst: 0, // 按流式增量估算的输出
         blockEst: 0, // 按 assistant 事件正文估算的输出
@@ -166,6 +172,13 @@
     m.output = Math.max(m.output, num(u.output_tokens));
     m.cacheRead = Math.max(m.cacheRead, num(u.cache_read_input_tokens));
     m.cacheWrite = Math.max(m.cacheWrite, num(u.cache_creation_input_tokens));
+    // 和 CLI 的判断一样：有 5 分钟的写入就是 5 分钟缓存，否则看有没有 1 小时的
+    const cc = u.cache_creation;
+    if (cc && typeof cc === 'object') {
+      if (num(cc.ephemeral_5m_input_tokens) > 0) m.ttl = '5m';
+      else if (num(cc.ephemeral_1h_input_tokens) > 0) m.ttl = '1h';
+    }
+    if (u.speed === 'fast') m.fast = true;
     if (exact && num(u.output_tokens)) m.exact = true;
     dirty = true;
   }
@@ -446,11 +459,47 @@
     }
   }
 
+  // 各额度窗口的读数历史 { 窗口名: { resetsAt, pts: [[毫秒时间, 已用比例], ...] } }，按时间排好，用来算最近的消耗速度。
+  // 存进 localStorage：刷新页面、换会话之后也能马上预测
+  let usageHist = lsJSON('ctm-usage-hist', {});
+  let histDirty = false;
+
+  function notePoint(name, resetsAt, u, at) {
+    if (!resetsAt || !at) return;
+    let hist = usageHist[name];
+    if (!hist || Math.abs(hist.resetsAt - resetsAt) > 300) {
+      if (hist && resetsAt < hist.resetsAt) return; // 已经过去的窗口
+      hist = usageHist[name] = { resetsAt, pts: [] };
+    }
+    const pts = hist.pts;
+    const near = pts.find((p) => Math.abs(p[0] - at) < 60000); // 一分钟之内的读数只留一个
+    if (near) {
+      if (u <= near[1]) return;
+      near[1] = u;
+    } else if (pts.length >= 2 && at > pts[pts.length - 1][0] && pts[pts.length - 1][1] === u && pts[pts.length - 2][1] === u) {
+      pts[pts.length - 1][0] = at; // 没变化的一段只留头尾
+    } else {
+      pts.push([at, u]);
+      pts.sort((a, b) => a[0] - b[0]);
+      if (pts.length > 400) pts.splice(0, pts.length - 400);
+    }
+    histDirty = true;
+  }
+
+  function saveHist() {
+    if (!histDirty) return;
+    histDirty = false;
+    const now = Date.now() / 1000;
+    for (const name in usageHist) if (!usageHist[name] || usageHist[name].resetsAt < now - 86400) delete usageHist[name];
+    lsSet('ctm-usage-hist', JSON.stringify(usageHist));
+  }
+
   // 同一窗口内用量只增不减，所以不论读数先后，同一重置时间取最大值；重置时间更晚的是新窗口。
   // 用量接口说窗口还没开始（重置时间为空）时，比它更早的读数都不再算数
   function mergeLimit(name, u, resetsAt, extra) {
     const cur = limits[name];
     const at = extra.at || 0;
+    notePoint(name, resetsAt, u, at);
     if (!resetsAt) {
       if (u > 0 || !at || (cur && cur.at > at)) return false;
       if (cur && !cur.resetsAt) return void (cur.at = at);
@@ -476,6 +525,60 @@
   function saveLimits() {
     lsSet('ctm-limits', JSON.stringify(limits));
     dirty = true;
+  }
+
+  const windowMs = (name) =>
+    name === 'five_hour' || /^scoped:session:/.test(name) ? 5 * 3600e3 : /^seven_day|^scoped:weekly:/.test(name) ? 7 * 864e5 : 0;
+
+  // 预测额度什么时候用完。5 小时额度看最近的消耗速度：至少回看 30 分钟，涨不到 3 个百分点就看得更久（最多 90 分钟），
+  // 读数不够时用这个窗口开始以来的平均速度。周额度用本周开始以来的平均速度，把不用的时候也算进去，
+  // 否则按一阵忙碌的速度会预测得太早。返回 { text, level, tip }；数据不够时返回 null
+  function forecast(l) {
+    const span = windowMs(l.name);
+    const now = Date.now();
+    const resetIn = l.resetsAt * 1000 - now;
+    if (!span || l.idle || l.expired || resetIn <= 0 || l.used >= 1) return null;
+    let rate = -1; // 每毫秒涨多少（比例）
+    let basis = '';
+    if (span < 864e5) {
+      const hist = usageHist[l.name];
+      let top = 0;
+      const pts = hist && Math.abs(hist.resetsAt - l.resetsAt) <= 300 ? hist.pts.map(([t, u]) => [t, (top = Math.max(top, u))]) : [];
+      let anchor = null;
+      for (const look of [30, 60, 90]) {
+        const a = pts.filter((p) => p[0] <= now - look * 60000).pop();
+        if (!a) break;
+        anchor = a;
+        if (l.used - a[1] >= 0.03) break;
+      }
+      if (!anchor && pts.length && now - pts[0][0] >= 600000) anchor = pts[0];
+      if (anchor) {
+        rate = Math.max(0, l.used - anchor[1]) / (now - anchor[0]);
+        basis = '最近 ' + fmtSpan(now - anchor[0]) + '的速度';
+      }
+    }
+    if (!basis) {
+      const elapsed = now - (l.resetsAt * 1000 - span);
+      if (elapsed < (span < 864e5 ? 900000 : 6 * 3600e3)) return null;
+      rate = l.used / elapsed;
+      basis = span < 864e5 ? '这个窗口开始以来的平均速度' : '本周开始以来的平均速度，含不用的时候';
+    }
+    const perHour = '（每小时约 +' + (rate * 3600e3 * 100).toFixed(1) + '%）';
+    if (rate <= 0) return { text: '最近没有消耗', level: 'normal', tip: `按${basis}：这段时间没有上涨。` };
+    const outIn = (1 - l.used) / rate;
+    if (outIn < resetIn) {
+      return {
+        text: '约 ' + fmtSpanShort(outIn) + '后用完 · 早于重置 ' + fmtSpanShort(resetIn - outIn),
+        level: outIn < 1800000 ? 'critical' : 'warning',
+        tip: `按${basis}${perHour}，约 ${fmtSpan(outIn)}后用到 100%，比重置早 ${fmtSpan(resetIn - outIn)}。`,
+      };
+    }
+    const end = l.used + rate * resetIn;
+    return {
+      text: '重置时约用到 ' + fmtPct(end),
+      level: 'normal',
+      tip: `按${basis}${perHour}，到重置时（还有 ${fmtSpan(resetIn)}）约用到 ${fmtPct(end)}，用不完。`,
+    };
   }
 
   // rate_limit_event：每次请求后 CLI 报告的额度读数（已用比例 0~1，重置时间为 unix 秒）
@@ -552,6 +655,9 @@
       } else if (e.key === 'ctm-extra') {
         extraUsage = JSON.parse(e.newValue);
         dirty = true;
+      } else if (e.key === 'ctm-usage-hist') {
+        const other = JSON.parse(e.newValue) || {};
+        for (const name in other) for (const [t, u] of (other[name] && other[name].pts) || []) notePoint(name, other[name].resetsAt, u, t);
       }
     } catch {}
   });
@@ -579,7 +685,10 @@
         if (o.scope !== 'local' && isModelId(o.fallback_model)) addInfo('model', o.fallback_model, 'fallback', ctx);
         break;
       case 'compact_boundary': {
-        // 压缩之后、下一次请求之前，上下文就是压缩后的大小
+        // 压缩之后、下一次请求之前，上下文就是压缩后的大小；之后的缓存也要重新建
+        const z = stamp(ctx);
+        state.compacts.push(z);
+        if (ctx.batch) ctx.batch.push(z);
         const post = num((o.compact_metadata || {}).post_tokens);
         if (post) addInfo('ctx', { used: post, max: 0 }, 'compact', ctx);
         break;
@@ -1017,6 +1126,115 @@
     }
     if (!best) return null;
     return { used: best.used, max: best.max || windowFor(modelInfo().id), compactAt, src: best.x.src || 'request' };
+  }
+
+  // ---------------------------------------------------------------- 提示缓存
+
+  // 主对话每次请求都会读上一次请求留下的提示缓存。缓存在最后一次使用之后按 TTL 过期：Claude Code 给订阅用户的
+  // 主对话用 1 小时，用到额外用量时是 5 分钟。过期之后，或者切换了模型、推理强度、快速模式，下一次请求要把整个
+  // 上下文按缓存写入价重新写一遍，比命中缓存贵得多，也照样消耗订阅额度
+
+  // 每百万 token 的输入单价和缓存读取单价（美元，2026 年 10 月的 API 标价）。缓存写入是输入单价的 2 倍（1 小时）
+  // 或 1.25 倍（5 分钟），快速模式整体翻倍；Haiku 5.5 的提示超过 10 万 token 时单价是 5 倍。没列出的模型按本会话的花费反推
+  const CACHE_PRICES = [
+    [/fable-5-1|mythos-5-1/, 10, 0.25],
+    [/fable|mythos/, 10, 1],
+    [/opus-5-5/, 4, 0.2],
+    [/opus-(5|4-[5-9])\b/, 5, 0.5],
+    [/opus/, 15, 1.5],
+    [/sonnet-5/, 2, 0.2],
+    [/sonnet/, 3, 0.3],
+    [/haiku-5/, 0.1, 0.01, 100000, 5],
+    [/haiku-4/, 1, 0.1],
+    [/haiku/, 0.8, 0.08],
+  ];
+  const TTL_MS = { '5m': 300000, '1h': 3600000 };
+
+  // 每个 token 的价格：{ write: 缓存写入, read: 缓存读取, input: 不走缓存的输入, listed: 是否来自价目表 }
+  function cachePrices(model, tokens, ttl, fast) {
+    const row = CACHE_PRICES.find(([re]) => re.test(String(model || '').toLowerCase()));
+    let input;
+    let read;
+    if (row) {
+      const tier = row[3] && tokens > row[3] ? row[4] : 1;
+      input = row[1] * tier;
+      read = row[2] * tier;
+    } else {
+      const r = state.results[state.results.length - 1];
+      const want = modelName(model).replace(/ 1M$/, '');
+      const name = r && Object.keys(r.byModel).find((k) => modelName(k).replace(/ 1M$/, '') === want);
+      const x = name && r.byModel[name];
+      const w = x ? weightOf(x, x.output) : 0;
+      if (!w || !x.cost) return null;
+      input = (x.cost / w) * 1e6;
+      read = input * PRICE_RATIO.cacheRead;
+    }
+    const k = (fast ? 2 : 1) / 1e6;
+    return { write: input * (ttl === '5m' ? 1.25 : 2) * k, read: read * k, input: input * k, listed: !!row };
+  }
+
+  const wallOf = (x) => (x.live ? x.at : x.ts); // 实时事件用到达时间，历史记录用事件时间
+  const between = (list, a, b) => list.some((z) => isAfter(z, a) && isAfter(b, z));
+
+  // 某项设置（推理强度、快速模式）在 a 之后、b 之前有没有变过；a 之前不知道是什么值时说不清，算没变
+  function changedBetween(key, a, b) {
+    const list = state.info[key] || [];
+    let before = null;
+    for (const x of list) if (!isAfter(x, a) && (!before || compare(x, before, (y) => y.seq) > 0)) before = x;
+    return !!before && list.some((x) => isAfter(x, a) && isAfter(b, x) && x.value !== before.value);
+  }
+
+  // { ttl, ttlKnown, warmAt, expiresAt, tokens: 下一次请求的上下文, nextExtra: 缓存过期后下一次请求多花的钱,
+  //   listed, rebuilds: [{ t, tokens, cause, expected, extra }] }
+  function cacheState() {
+    const main = [];
+    for (const m of state.messages.values()) if (m.lane === 'main' && orderKey(m) != null && messageContext(m) > 0) main.push(m);
+    if (!main.length) return null;
+    main.sort((a, b) => orderKey(a) - orderKey(b));
+    let ttl = '';
+    for (let i = main.length - 1; i >= 0 && !ttl; i--) ttl = main[i].ttl;
+    const ttlKnown = !!ttl;
+    ttl ||= '1h'; // 请求的用量里没有写入明细时，按订阅用户的默认值
+
+    // 缓存重建：上一次请求的整个提示本该从缓存读出来，读到的少很多就是重建了。/clear、压缩之后的重建是正常的，不算多花
+    const rebuilds = [];
+    for (let i = 1; i < main.length; i++) {
+      const p = main[i - 1];
+      const m = main[i];
+      const prev = messageContext(p);
+      const missed = prev - m.cacheRead;
+      if (missed < Math.max(20000, prev * 0.2)) continue;
+      const gap = wallOf(m) - wallOf(p);
+      let cause;
+      let expected = false;
+      if (between(state.resets, p, m)) [cause, expected] = ['/clear 之后的新对话', true];
+      else if (between(state.compacts, p, m) || messageContext(m) < prev * 0.6) [cause, expected] = ['上下文压缩后重建', true];
+      else if (gap > TTL_MS[p.ttl || ttl]) cause = '闲置 ' + fmtSpan(gap) + '，缓存过期';
+      else if (p.model && m.model && modelName(p.model) !== modelName(m.model)) cause = '切换了模型';
+      else if (changedBetween('effort', p, m)) cause = '改了推理强度';
+      else if (p.fast !== m.fast || changedBetween('fast', p, m)) cause = '切换了快速模式';
+      else cause = '原因不明：工具、系统提示或较早的消息变了';
+      const pr = cachePrices(m.model, prev, m.ttl || ttl, m.fast);
+      const extra = expected || !pr ? 0 : missed * ((m.cacheWrite >= missed / 2 ? pr.write : pr.input) - pr.read);
+      rebuilds.push({ t: wallOf(m), tokens: missed, cause, expected, extra });
+    }
+
+    const last = main[main.length - 1];
+    const cut = latestOf(state.resets, (x) => x.seq);
+    const c = contextNow();
+    const tokens = c && !(cut && isAfter(cut, last)) ? c.used : 0; // /clear 之后旧缓存用不上了
+    const mi = modelInfo();
+    const pr = cachePrices(last.model || mi.id, tokens, ttl, mi.fast);
+    return {
+      ttl,
+      ttlKnown,
+      warmAt: wallOf(last),
+      expiresAt: wallOf(last) + TTL_MS[last.ttl || ttl],
+      tokens,
+      nextExtra: pr && tokens ? tokens * (pr.write - pr.read) : 0,
+      listed: !!pr && pr.listed,
+      rebuilds,
+    };
   }
 
   // ---------------------------------------------------------------- 额度折合多少钱
@@ -1499,7 +1717,15 @@
       totals: sessionTotals(),
       lastTurn: lastTurn(),
       context: contextNow(),
+      cache: (() => {
+        const cs = cacheState();
+        if (!cs) return null;
+        const { rebuilds, ...rest } = cs;
+        return { ...rest, expiresIn: Math.round((cs.expiresAt - Date.now()) / 1000), rebuilds: rebuilds.map(({ t, ...r }) => ({ ...r, ago: Math.round((Date.now() - t) / 1000) })) };
+      })(),
       limits,
+      forecasts: Object.fromEntries(limitViews().map((l) => [l.name, forecast(l)])),
+      usageHist: Object.fromEntries(Object.entries(usageHist).map(([k, x]) => [k, x.pts.length])),
       extraUsage,
       quota: quotaRates(),
       poll: { on: pollOn, fails: pollFails, error: pollErr, org: !!currentOrg(), at: pollAt ? new Date(pollAt).toISOString() : null },
@@ -1536,6 +1762,18 @@
     if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
     return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分';
   }
+
+  // 较长的时间段：45 秒、42 分钟、1 小时 15 分钟、2.3 天
+  function fmtSpan(ms) {
+    const m = Math.round(Math.max(0, ms) / 60000);
+    if (m < 1) return Math.round(Math.max(0, ms) / 1000) + ' 秒';
+    if (m < 60) return m + ' 分钟';
+    if (m < 1440) return Math.floor(m / 60) + ' 小时' + (m % 60 ? ' ' + (m % 60) + ' 分钟' : '');
+    return +(m / 1440).toFixed(1) + ' 天';
+  }
+
+  // 放在窄的一行里：42 分钟、1.5 小时、2.3 天
+  const fmtSpanShort = (ms) => (ms < 3600e3 ? fmtSpan(ms) : ms < 864e5 ? +(ms / 3600e3).toFixed(1) + ' 小时' : +(ms / 864e5).toFixed(1) + ' 天');
 
   function fmtAgo(ms) {
     const m = Math.round((Date.now() - ms) / 60000);
@@ -1680,6 +1918,7 @@
     .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; transition: width .4s ease; }
     .mark { position: absolute; top: -2px; bottom: -2px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--ink2); opacity: .5; }
     .est { color: var(--muted); font-size: 11px; line-height: 15px; text-align: right; margin-top: 3px; }
+    .track + .row { margin-top: 6px; }
     .grid { display: grid; grid-template-columns: auto 1fr auto 1fr; column-gap: 8px; row-gap: 1px; margin-top: 4px; }
     .k { color: var(--ink2); white-space: nowrap; }
     .k.second { padding-left: 8px; }
@@ -1924,6 +2163,9 @@
     const ctxBlock = h('div', 'block');
     ui.context = addRow(ctxBlock, '上下文');
     ui.ctxMeter = meter(ctxBlock);
+    ui.cache = addRow(ctxBlock, '提示缓存');
+    ui.cacheEst = h('div', 'est');
+    ctxBlock.append(ui.cacheEst);
     ui.limitsBox = h('div');
     body.append(ctxBlock, ui.limitsBox);
     ui.extra = addRow(body, '额外用量', '超出订阅额度后按量付费的部分（本月）');
@@ -2083,6 +2325,7 @@
     // 收起时也定期算一次并存下来，下次换会话时能直接用
     if (state.readings.length && Date.now() - quotaAt > 30000) quotaRates();
     if (tick % 20 === 0) pollUsage(false);
+    if (tick % 10 === 0) saveHist();
   }
 
   function paint(force) {
@@ -2100,7 +2343,7 @@
     if (!force && !dirty && !active && now - paintedAt < 15000) return;
     dirty = false;
     paintedAt = now;
-    const v = { ...live, turn: lastTurn(), c: contextNow(), lims: limitViews(), t: sessionTotals(), mi: modelInfo() };
+    const v = { ...live, turn: lastTurn(), c: contextNow(), lims: limitViews(), t: sessionTotals(), mi: modelInfo(), cache: cacheState() };
     if (mode === 'compact') paintCompact(v);
     else paintFull(v);
   }
@@ -2116,6 +2359,9 @@
       // 5 小时额度总是显示；其他窗口用到一半以上才显示
       if (l.name === 'five_hour' || l.used >= 0.5 || l.level !== 'normal') parts.push([l.short + ' ' + limitShort(l), l.level]);
     }
+    // 缓存快过期时提醒：上下文大的时候，过期后的第一条消息要多花不少
+    const left = v.cache && !v.active && v.cache.tokens >= 50000 ? v.cache.expiresAt - Date.now() : 0;
+    if (left > 0 && left <= 600000) parts.push(['缓存 ' + fmtSpan(left), 'warning']);
     if (v.t.cost) parts.push([(v.t.approxCost ? '≈' : '') + fmtCost(v.t.cost, true)]);
     if (!parts.length) parts.push(['Token Meter']);
     const key = JSON.stringify(parts);
@@ -2226,6 +2472,48 @@
     ui.cap.title = ui.big.title = tips.join('\n');
   }
 
+  // 文字前面按程度加个状态色小方块；文字本身一直显示，颜色不单独表达含义
+  function setText(el, text, level) {
+    el.textContent = '';
+    if (level && level !== 'normal') {
+      const sq = h('span', 'sq');
+      sq.style.background = STATUS[level];
+      el.append(sq);
+    }
+    el.append(text);
+  }
+
+  const fmtDollars = (v) => fmtUsd(v, v < 100);
+
+  function paintCache(cs, active) {
+    const show = !!cs && cs.tokens > 0;
+    const wasted = show ? cs.rebuilds.filter((r) => !r.expected) : [];
+    ui.cache.row.style.display = show ? '' : 'none';
+    ui.cacheEst.style.display = wasted.length ? '' : 'none';
+    if (!show) return;
+    const left = cs.expiresAt - Date.now();
+    const ttlName = cs.ttl === '5m' ? '5 分钟' : '1 小时';
+    if (active) setText(ui.cache.value, '使用中');
+    else if (left > 0) setText(ui.cache.value, '还剩 ' + fmtSpan(left), left <= 600000 ? 'warning' : 'normal');
+    else setText(ui.cache.value, cs.nextExtra ? '已过期 · 下条约多花 ' + fmtDollars(cs.nextExtra) : '已过期', 'warning');
+    ui.cache.row.title =
+      `主对话的提示缓存是 ${ttlName}的（${cs.ttlKnown ? '来自请求的用量数据' : '推测，订阅用户的默认值'}），最后一次请求之后 ${ttlName}过期。\n` +
+      `过期之后，或者切换了模型、推理强度、快速模式，下一条消息要把整个上下文（${fmt(cs.tokens)} token）按缓存写入价重写一遍` +
+      (cs.nextExtra ? `，比命中缓存多花约 ${fmtDollars(cs.nextExtra)}${cs.listed ? '' : '（单价按本会话的花费推算）'}` : '') +
+      '，也照样消耗订阅额度。';
+    if (wasted.length) {
+      const sum = wasted.reduce((s, r) => s + r.extra, 0);
+      ui.cacheEst.textContent = '本会话缓存重建 ' + wasted.length + ' 次' + (sum ? ' · 约多花 ' + fmtDollars(sum) : '');
+      ui.cacheEst.title =
+        '/clear 和上下文压缩之后的重建是正常的，不算在内。最近几次：\n' +
+        wasted
+          .slice(-8)
+          .reverse()
+          .map((r) => fmtReset(r.t / 1000) + ' · ' + r.cause + ' · 重写 ' + fmt(r.tokens) + (r.extra ? ' · 约 ' + fmtDollars(r.extra) : ''))
+          .join('\n');
+    }
+  }
+
   function paintLimits(lims) {
     const rates = lims.length ? quotaRates() : {};
     const shown = new Set();
@@ -2245,26 +2533,37 @@
         r.value.textContent = fmtPct(l.used) + ' · ' + fmtReset(l.resetsAt) + ' 重置';
         r.row.title = `还有 ${fmtLeft(l.resetsAt)}重置。数值是这里观察到的最大值。` + fresh;
       }
+      // 下面一行是预测什么时候用完；折合美元的剩余量放在悬停提示里，预测不出来时才显示在这一行
+      let dollars = '';
+      let dollarsTip = '';
       if (q && !(l.used >= 1)) {
         const full = q.perPoint * 100; // 整个窗口折合的美元
         const left = Math.max(0, 1 - l.used) * full;
         const hours = rates.secPerDollar ? (left * rates.secPerDollar) / 3600 : null;
-        r.est.textContent = '约剩 ' + fmtUsd(left) + (hours == null ? '' : ' · ' + fmtHours(hours));
-        r.est.title =
-          `按 API 标价折算，整个 ${l.label}约 ${fmtUsd(full)}（每 1% ≈ ${fmtUsd(q.perPoint, true)}` +
+        dollars = '约剩 ' + fmtUsd(left) + (hours == null ? '' : ' · ' + fmtHours(hours));
+        dollarsTip =
+          `${dollars}：按 API 标价折算，整个 ${l.label}约 ${fmtUsd(full)}（每 1% ≈ ${fmtUsd(q.perPoint, true)}` +
           (q.ratio
             ? `：5 小时额度每 1% ≈ ${fmtUsd(rates.five_hour.perPoint, true)}，这项额度每涨 1%，5 小时额度大约涨 ${q.ratio.toFixed(1)}%，依据 ${q.points} 个百分点的变化）`
             : `，依据 ${q.points} 个百分点、${fmtUsd(q.dollars)} 的花费）`) +
           (rates.secPerDollar ? `；按你最近的用法，模型每运行 1 小时约花 ${fmtUsd(3600 / rates.secPerDollar)}` : '') +
           '。只是估算：假设统计期间账号没有别处的使用；换模型或用法差别很大时会不准。';
+      }
+      const fc = forecast(l);
+      if (fc) {
+        setText(r.est, fc.text, fc.level);
+        r.est.title = fc.tip + (dollarsTip ? '\n\n' + dollarsTip : '');
       } else if (l.used >= 1) {
-        r.est.textContent = '已用完';
+        setText(r.est, '已用完');
         r.est.title = '';
-      } else if (LIMIT_NAMES[l.name]) {
-        r.est.textContent = '剩余：估算中';
-        r.est.title = '这个页面看到这项额度涨过至少两次后，才能估算它折合多少钱';
+      } else if (dollars) {
+        setText(r.est, dollars);
+        r.est.title = dollarsTip;
+      } else if (LIMIT_NAMES[l.name] && !l.idle) {
+        setText(r.est, l.expired ? '' : '剩余：估算中');
+        r.est.title = '再观察一阵用量的变化（5 小时额度约 10 分钟，周额度约 6 小时）后，就能预测什么时候用完';
       } else {
-        r.est.textContent = '';
+        setText(r.est, '');
         r.est.title = '';
       }
       r.est.style.display = r.est.textContent ? '' : 'none';
@@ -2290,6 +2589,7 @@
     ui.context.row.title =
       '主对话最近一次请求的输入 token（含缓存）/ 模型上下文窗口' + (c && c.compactAt ? `\n竖线是自动压缩阈值（约 ${fmt(c.compactAt)}）` : '');
     setMeter(ui.ctxMeter, frac, levelOf(frac, 0.7, 0.9), c && c.compactAt && c.max ? c.compactAt / c.max : 0);
+    paintCache(v.cache, v.active);
     paintLimits(lims);
 
     ui.cost.value.textContent = t.cost ? (t.approxCost ? '≈' : '') + fmtCost(t.cost) : '–';
@@ -2337,6 +2637,8 @@
     totals: sessionTotals,
     runs,
     context: contextNow,
+    cache: cacheState,
+    forecast: () => Object.fromEntries(limitViews().map((l) => [l.name, forecast(l)])),
     model: modelInfo,
     lastTurn,
     quota: () => ({ session: sessionQuotaRates(), combined: quotaRates() }),
