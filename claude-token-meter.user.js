@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.3.2
-// @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示 token 用量与生成速度
+// @version      1.4.0
+// @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示模型、推理强度、token 用量、生成速度与订阅额度
 // @match        https://claude.ai/*
 // @run-at       document-start
 // @grant        none
@@ -11,18 +11,22 @@
 /*
  * 原理：在页面上下文里挂钩 fetch / XMLHttpRequest / WebSocket / EventSource，
  * 从流经的数据里识别 Claude Code stream-json（以及 Anthropic API 流式）事件：
- *   - type:"result" 的 modelUsage / total_cost_usd → 会话累计用量与费用。CLI 的文档说明这两个字段是
- *     截至目前的累计值，应取最新一条而不是相加
- *   - type:"assistant" 的 message.usage             → 本轮还没结束时的输入/缓存用量（按 message.id 去重）。
+ *   - type:"result" 的 modelUsage / total_cost_usd → 会话累计用量与费用。这是当前这段运行的累计值，应取最新一条；
+ *     /clear 之后（以及续接时没有存档）会从零重新开始，所以按段取各段最后一条再相加
+ *   - type:"assistant" 的 message.usage / model       → 本轮还没结束时的输入/缓存用量（按 message.id 去重）、实际服务的模型。
  *     其中的 output_tokens 只是请求刚开始时的占位值（个位数），输出量改按正文长度估算
  *   - stream_event 包着的 message_start / content_block_delta / message_delta / message_stop
  *                                                    → 实时速度；message_delta 带精确输出数，用来校准估算
- *   - result.usage.output_tokens 与 duration_api_ms 的增量 → 上一轮的平均速度
- *   - get_context_usage 的响应                        → 上下文占用（网页端查询上下文时才有）
- *   - rate_limit_event 的 unifiedWindows             → 订阅额度（5 小时 / 7 天窗口的已用比例与重置时间）
+ *   - system/thinking_tokens                         → 看不见的思考的进度，思考时也能算出速度
+ *   - system/init、会话元数据 external_metadata、get_settings 的响应、网页发出的 set_model / apply_flag_settings
+ *                                                    → 模型、推理强度（effort）、快速模式
+ *   - result.modelUsage 与 duration_api_ms 的增量    → 上一轮的输出量与平均速度
+ *   - get_context_usage 的响应、会话元数据的 context_usage → 上下文占用
+ *   - rate_limit_event 的 unifiedWindows、claude.ai 的用量接口 → 订阅额度（各窗口的已用比例与重置时间）
  * 历史记录（一次加载多条）只计入用量，不计入速度。思考内容在网页端不可见，只能从精确数里看到。
+ * 对话内容（用户消息、工具调用与结果、正文）里的 JSON 不当成事件：读到的日志文件不能把统计带偏。
  *
- * 控制台可用：__ctm.state 查看状态，__ctm.debug(true) 打印抓到的数据。
+ * 控制台可用：__ctm.state 查看状态，__ctm.debug(true) 打印抓到的数据，__ctm.diagnostics() 查看诊断信息。
  */
 (function () {
   'use strict';
@@ -30,11 +34,13 @@
   const W = window;
   if (W.__ctm) return;
 
+  const VERSION = '1.4.0';
   const FLOW_MS = 1500; // 这么久内收到过 token 视为“正在输出”
   const STALE_MS = 60000; // 流式请求这么久没动静就当作已结束（防止漏掉 message_stop）
   const SPEED_WINDOW_MS = 2000; // 实时速度的滑动窗口
   const HISTORY_AGE_MS = 600000; // 带时间戳且早于 10 分钟的事件视为历史（留出本机时钟误差）
   const SPARK_POINTS = 120; // 速度曲线保留的点数（每 500ms 一个）
+  const KINDS = ['input', 'output', 'cacheRead', 'cacheWrite'];
 
   const lsGet = (k) => {
     try {
@@ -48,6 +54,13 @@
       localStorage.setItem(k, v);
     } catch {}
   };
+  const lsJSON = (k, fallback) => {
+    try {
+      return JSON.parse(lsGet(k) || 'null') || fallback;
+    } catch {
+      return fallback;
+    }
+  };
 
   let debug = lsGet('ctm-debug') === '1';
   const log = (...a) => debug && console.log('[token-meter]', ...a);
@@ -58,17 +71,21 @@
     return {
       seen: new Set(), // 已处理的事件 uuid
       seq: 0, // 到达顺序
+      rev: 0, // result 和 /clear 记录的版本，分段结果按它缓存
       messages: new Map(), // message id -> 见 messageRecord()
       results: [], // result 快照，按先后排序
+      resets: [], // /clear（conversation_reset）发生的位置：累计值从这里重新开始
       readings: [], // 本会话收到的额度读数，用来估算额度折合多少钱
+      info: {}, // 模型、推理强度、上下文读数等线索：项目 -> [记录]，用的时候取最新的一条
+      metaSeen: {}, // 会话元数据里各项上一次的值
       lanes: new Map(), // 正在流式输出的请求：主对话为 'main'，子代理按 parent_tool_use_id 区分
-      ctxUsage: null, // get_context_usage 的响应
       lastResp: null,
       samples: [], // [timestamp, tokens]
       spark: [],
       peak: 0,
       calib: 1, // 估算 → 精确 token 的校准系数
       anon: 0,
+      types: {}, // 各类事件的数量，诊断用
     };
   }
   let state = freshState();
@@ -127,6 +144,7 @@
       m = {
         ...stamp(ctx),
         lane: lane || 'main',
+        model: '',
         input: 0,
         output: 0,
         cacheRead: 0,
@@ -166,29 +184,40 @@
 
   function recordResult(o, ctx) {
     const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    const byModel = {}; // 各模型的累计值，包括费用和思考 token（已含在输出里）
+    let thinking = 0;
     let window = 0;
-    let models = 0;
     for (const name in o.modelUsage || {}) {
       const x = o.modelUsage[name] || {};
-      totals.input += num(x.inputTokens);
-      totals.output += num(x.outputTokens);
-      totals.cacheRead += num(x.cacheReadInputTokens);
-      totals.cacheWrite += num(x.cacheCreationInputTokens);
-      window = Math.max(window, num(x.contextWindow));
-      models++;
+      const t = {
+        input: num(x.inputTokens),
+        output: num(x.outputTokens),
+        cacheRead: num(x.cacheReadInputTokens),
+        cacheWrite: num(x.cacheCreationInputTokens),
+        thinking: num(x.thinkingTokens),
+        cost: num(x.costUSD),
+        window: num(x.contextWindow),
+      };
+      byModel[name] = t;
+      for (const k of KINDS) totals[k] += t[k];
+      thinking += t.thinking;
+      window = Math.max(window, t.window);
     }
+    const models = Object.keys(byModel).length;
     const cost = num(o.total_cost_usd);
     if (!models && !cost) return; // 出错或空操作的 result 带的是全零值
     const u = o.usage || {};
     // result 自身没有时间戳时，用“本轮开始时间 + 本轮耗时”推出结束时间
-    const end = num(o.turn_started_wall_ms) && num(o.duration_ms) ? o.turn_started_wall_ms + o.duration_ms : 0;
+    const start = num(o.turn_started_wall_ms) || num(o.request_sent_wall_ms);
+    const end = start && num(o.duration_ms) ? start + o.duration_ms : 0;
     const r = {
       ...stamp(ctx, end),
       cost,
       totals: models ? totals : null,
+      byModel,
+      thinking,
       window,
-      turnOut: num(u.output_tokens),
-      // 本轮的用量（不是累计值）
+      // 本轮主对话的用量（不是累计值，也不含子代理）
       turn: {
         input: num(u.input_tokens),
         output: num(u.output_tokens),
@@ -200,24 +229,171 @@
     };
     state.results.push(r);
     if (ctx.batch) ctx.batch.push(r);
+    sortResults();
+    if (o.fast_mode_state) addInfo('fast', o.fast_mode_state, 'result', ctx);
+    if (!ctx.bulk) {
+      // 一轮结束了，还开着的流也都结束了；额度刚变过，稍后刷新一次
+      for (const lane of [...state.lanes.keys()]) closeLane(lane, performance.now());
+      setTimeout(() => pollUsage(true), 4000);
+    }
+  }
+
+  function sortResults() {
     state.results.sort((a, b) => compare(a, b, resultWeight));
+    state.rev++;
     dirty = true;
   }
 
   // ---------------------------------------------------------------- 实时流
 
   const laneOf = (ctx) => ctx.lane || 'main';
+  const newLane = (m, bulk) => ({ m, bulk, t0: performance.now(), first: 0, last: 0, est: 0, think: 0, thinkAt: 0, exact: 0, thinking: false });
 
   function closeLane(lane, end) {
     const s = state.lanes.get(lane);
     if (!s) return;
     state.lanes.delete(lane);
     if (s.bulk || !s.last) return;
-    // 有精确数（含看不见的思考）时从 message_start 算起，否则只算可见增量的时间
-    const tokens = s.exact || s.est;
+    // 有精确数（含看不见的思考）时从 message_start 算起，否则只算收到增量的这段时间
+    const tokens = s.exact || s.est + s.think;
     const dur = ((s.exact ? end || s.last : s.last) - (s.exact ? s.t0 : s.first)) / 1000;
     state.lastResp = { tokens, speed: dur > 0.3 ? tokens / dur : null, exact: !!s.exact };
     dirty = true;
+  }
+
+  // system/thinking_tokens：思考内容看不见，但 CLI 会报告估算的思考 token 数，用来算思考时的速度
+  function thinkingProgress(o, ctx) {
+    const d = num(o.estimated_tokens_delta);
+    if (ctx.bulk || d <= 0) return;
+    const now = performance.now();
+    let s = state.lanes.get('main');
+    if (!s) state.lanes.set('main', (s = newLane(null, false))); // 没有转发 stream_event 时也能显示
+    if (!s.first) s.first = now;
+    s.last = s.thinkAt = now;
+    s.think = Math.max(s.think + d, num(o.estimated_tokens));
+    s.thinking = true;
+    state.samples.push([now, d]);
+    dirty = true;
+  }
+
+  // ---------------------------------------------------------------- 模型与推理强度
+
+  // 每条线索都记下来，用的时候取最新的一条：历史记录常常倒序加载，要等这批数据的时间戳补齐之后才能比较先后。
+  // 会话元数据会被反复拉取，值没变就不算新线索，免得盖过之后实时到达的事件
+  function addInfo(key, value, src, ctx) {
+    if (src === 'metadata' || src === 'session') {
+      const k = src + ':' + key;
+      const v = JSON.stringify(value === undefined ? null : value);
+      if (state.metaSeen[k] === v) return;
+      state.metaSeen[k] = v;
+    }
+    const rec = { ...stamp(ctx), value, src };
+    const list = (state.info[key] ||= []);
+    list.push(rec);
+    if (list.length > 2000) {
+      list.sort((a, b) => compare(a, b, (x) => x.seq));
+      list.splice(0, list.length - 500);
+    }
+    if (ctx.batch) ctx.batch.push(rec);
+    dirty = true;
+  }
+
+  function latestInfo(key) {
+    let best = null;
+    for (const x of state.info[key] || []) if (!best || compare(x, best, (y) => y.seq) > 0) best = x;
+    return best;
+  }
+
+  const isModelId = (v) => typeof v === 'string' && v.length > 1 && v.length < 120 && v[0] !== '<'; // <synthetic> 是 CLI 自己生成的消息
+  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
+  // claude-opus-5-5 → Opus 5.5；claude-sonnet-4-5-20250929 → Sonnet 4.5；claude-3-5-haiku → Haiku 3.5；
+  // Bedrock / Vertex 的写法去掉前后缀；带 [1m] 的是 1M 上下文版本；opus 这类别名首字母大写
+  function modelName(id) {
+    if (!isModelId(id)) return '';
+    let s = id.toLowerCase().trim();
+    const oneM = /\[1m\]/.test(s);
+    s = s
+      .replace(/\[[^\]]*\]/g, '')
+      .replace(/^.*?(?=claude-)/, '')
+      .replace(/@.*$/, '')
+      .replace(/-v\d+(:\d+)?$/, '')
+      .replace(/-\d{8}$/, '');
+    let m = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?$/.exec(s);
+    let name = m ? cap(m[1]) + ' ' + m[2] + (m[3] ? '.' + m[3] : '') : '';
+    if (!name && (m = /^claude-(\d+)(?:-(\d))?-([a-z]+)$/.exec(s))) name = cap(m[3]) + ' ' + m[1] + (m[2] ? '.' + m[2] : '');
+    if (!name) name = s === 'default' ? '默认模型' : /^[a-z]+$/.test(s) ? cap(s) : id;
+    return name + (oneM ? ' 1M' : '');
+  }
+
+  const EFFORT_NAMES = { low: '低', medium: '中', high: '高', xhigh: '超高', max: '最高' };
+  const INFO_SOURCES = {
+    init: '每轮开始时的 init 事件',
+    assistant: '最近一次请求的响应',
+    stream: '最近一次请求的响应',
+    metadata: '会话元数据',
+    session: '会话信息',
+    settings: '会话设置（get_settings）',
+    request: '网页发出的切换请求',
+    context: '上下文查询',
+    fallback: '拒答后换用的模型',
+    result: 'result 事件',
+  };
+
+  // 当前模型：实际服务的模型和设置的模型取较新的一条（刚切换模型时设置的更新，降级重试时实际服务的更新）
+  function modelInfo() {
+    const served = latestInfo('served');
+    const set = latestInfo('model');
+    let cur = served && (!set || !isAfter(set, served)) ? served : set;
+    if (cur === set && served && !/\d/.test(set.value)) cur = served; // default / opus 这类别名看不出具体版本
+    const effort = latestInfo('effort');
+    const fast = latestInfo('fast');
+    const ultra = latestInfo('ultracode');
+    const ev = effort && effort.value;
+    return {
+      id: cur ? cur.value : '',
+      src: cur ? cur.src : '',
+      served: served ? served.value : '',
+      set: set ? set.value : '',
+      effort: typeof ev === 'string' || typeof ev === 'number' ? String(ev) : '',
+      effortNone: !!effort && ev === null, // 明确说了不发送推理强度（模型不支持）
+      effortSrc: effort ? effort.src : '',
+      fast: !!fast && fast.value === 'on',
+      ultracode: !!ultra && ultra.value === true,
+    };
+  }
+
+  // 网页发给会话的控制请求（切换模型、改推理强度）；历史记录里也可能有
+  function handleRequest(r, ctx) {
+    if (r.subtype === 'set_model') addInfo('model', isModelId(r.model) ? r.model : 'default', 'request', ctx);
+    else if (r.subtype === 'apply_flag_settings' && r.settings && typeof r.settings === 'object') {
+      const s = r.settings;
+      // effortLevel 为 null 表示回到模型默认值，具体是多少这里不知道
+      if ('effortLevel' in s) addInfo('effort', s.effortLevel == null ? undefined : s.effortLevel, 'request', ctx);
+      if ('ultracode' in s) addInfo('ultracode', s.ultracode === true, 'request', ctx);
+      if (isModelId(s.model)) addInfo('model', s.model, 'request', ctx);
+    }
+  }
+
+  // 会话对象的 external_metadata：云端会话把当前模型、上次实际服务的模型、推理强度、上下文占用都写在这里
+  function applyMetadata(md, ctx) {
+    if (isModelId(md.model)) addInfo('model', md.model, 'metadata', ctx);
+    if (isModelId(md.last_served_model)) addInfo('served', md.last_served_model, 'metadata', ctx);
+    if ('effort_level' in md) addInfo('effort', md.effort_level, 'metadata', ctx);
+    if ('is_ultracode_active' in md) addInfo('ultracode', md.is_ultracode_active === true, 'metadata', ctx);
+    const cu = md.context_usage;
+    if (cu && typeof cu === 'object' && num(cu.used_tokens)) {
+      addInfo('ctx', { used: num(cu.used_tokens), max: num(cu.max_tokens) }, 'metadata', ctx);
+    }
+  }
+
+  // 会话列表里有很多会话，只认当前页面这个：会话 id 去掉前缀（session_ / cse_）后应出现在地址里
+  function isCurrentSession(o) {
+    const id = o.id || o.session_id || o.uuid;
+    if (id == null) return true;
+    if (typeof id !== 'string') return false;
+    const tail = id.replace(/^[a-z]+_/i, '');
+    return tail.length >= 10 && location.pathname.includes(tail);
   }
 
   // ---------------------------------------------------------------- 订阅额度
@@ -229,14 +405,23 @@
     seven_day_opus: ['7 天 Opus', '7d Opus'],
     seven_day_sonnet: ['7 天 Sonnet', '7d Sonnet'],
     seven_day_overage_included: ['7 天（含超额）', '7d+'],
+    seven_day_oauth_apps: ['7 天（OAuth 应用）', '7d OAuth'],
   };
 
+  function limitNames(name) {
+    if (LIMIT_NAMES[name]) return LIMIT_NAMES[name];
+    // 用量接口按模型或产品单独计的窗口：scoped:<分组>:<名称>
+    const m = /^scoped:([^:]*):(.+)$/.exec(name);
+    if (m) return m[1] === 'session' ? ['5 小时 ' + m[2], '5h ' + m[2]] : ['7 天 ' + m[2], '7d ' + m[2]];
+    return [name, name];
+  }
+
   // 额度是账号级的，不随会话清零，并存进 localStorage：刷新页面、打开别的会话时也能立刻显示。
-  // name -> { utilization: 已用比例（通常 0~1）, resetsAt: 重置时间（unix 秒）, status }
-  let limits = {};
-  try {
-    limits = JSON.parse(lsGet('ctm-limits') || '{}') || {};
-  } catch {}
+  // name -> { utilization: 已用比例（0~1）, resetsAt: 重置时间（unix 秒，0 表示窗口还没开始）,
+  //           status / severity: 服务端给的状态, at: 读数时间（毫秒）, src: 'event' | 'official' }
+  let limits = lsJSON('ctm-limits', {});
+  let extraUsage = lsJSON('ctm-extra', null); // 额外用量（超出订阅后按量付费）
+  let officialAt = 0; // 最近一次从 claude.ai 用量接口拿到数据的时间
 
   function windowsOf(info) {
     const windows = { ...(info.unifiedWindows || {}) };
@@ -261,35 +446,113 @@
     }
   }
 
-  // 同一窗口内用量只增不减，所以不论事件先后，同一 resetsAt 取最大值；resetsAt 更晚的是新窗口
-  function recordLimits(info) {
+  // 同一窗口内用量只增不减，所以不论读数先后，同一重置时间取最大值；重置时间更晚的是新窗口。
+  // 用量接口说窗口还没开始（重置时间为空）时，比它更早的读数都不再算数
+  function mergeLimit(name, u, resetsAt, extra) {
+    const cur = limits[name];
+    const at = extra.at || 0;
+    if (!resetsAt) {
+      if (u > 0 || !at || (cur && cur.at > at)) return false;
+      if (cur && !cur.resetsAt) return void (cur.at = at);
+      limits[name] = { utilization: 0, resetsAt: 0, at, src: extra.src };
+      return true;
+    }
+    if (cur && !cur.resetsAt && (resetsAt * 1000 <= Date.now() || cur.at > at)) return false;
+    const same = !!cur && !!cur.resetsAt && Math.abs(resetsAt - cur.resetsAt) <= 300;
+    if (cur && cur.resetsAt && !same && resetsAt < cur.resetsAt) return false; // 已经过去的窗口
+    const next = {
+      utilization: same ? Math.max(u, cur.utilization) : u,
+      resetsAt: same ? cur.resetsAt : resetsAt,
+      status: extra.status || (same ? cur.status : undefined),
+      severity: extra.severity || (same ? cur.severity : undefined),
+      at: Math.max(at, (same && cur.at) || 0),
+      src: extra.src === 'official' || !same ? extra.src : cur.src,
+    };
+    const changed = !same || next.utilization !== cur.utilization || next.status !== cur.status || next.severity !== cur.severity;
+    limits[name] = next;
+    return changed || next.src !== cur.src;
+  }
+
+  function saveLimits() {
+    lsSet('ctm-limits', JSON.stringify(limits));
+    dirty = true;
+  }
+
+  // rate_limit_event：每次请求后 CLI 报告的额度读数（已用比例 0~1，重置时间为 unix 秒）
+  function recordLimits(info, ctx) {
     if (!info || typeof info !== 'object') return;
     const windows = windowsOf(info);
+    const at = ctx.bulk ? ctx.ts || 0 : Date.now();
     let changed = false;
     for (const name in windows) {
       const w = windows[name] || {};
       const resetsAt = num(w.resetsAt);
       if (!resetsAt) continue;
-      const utilization = num(w.utilization);
-      const cur = limits[name];
-      const same = !!cur && Math.abs(resetsAt - cur.resetsAt) <= 60;
-      if (cur && (same ? utilization < cur.utilization : resetsAt < cur.resetsAt)) continue;
-      const status = w.status || (name === info.rateLimitType ? info.status : same ? cur.status : undefined);
-      if (same && utilization === cur.utilization && status === cur.status) continue;
-      limits[name] = { utilization, resetsAt, status };
-      changed = true;
+      const status = w.status || (name === info.rateLimitType ? info.status : undefined);
+      changed = mergeLimit(name, num(w.utilization), resetsAt, { src: 'event', status, at }) || changed;
     }
-    if (changed) {
-      lsSet('ctm-limits', JSON.stringify(limits));
-      dirty = true;
+    if (changed) saveLimits();
+  }
+
+  const isoSec = (v) => {
+    const t = typeof v === 'string' ? Date.parse(v) : typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : NaN;
+    return isFinite(t) && t > 0 ? Math.round(t / 1000) : 0;
+  };
+  const LEGACY_WINDOWS = ['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_oauth_apps'];
+  const isWindow = (w) => !!w && typeof w === 'object' && 'utilization' in w && 'resets_at' in w;
+
+  // claude.ai 的用量接口（设置里用量页面用的同一个接口）以及 /usage 的结构化结果：已用百分比（0~100）和 ISO 格式的重置时间。
+  // 新格式是服务端排好的 limits[] 行，旧格式是 five_hour / seven_day 这些键
+  function recordOfficial(o, at) {
+    const rows = [];
+    const list = o.limits;
+    if (Array.isArray(list) && list.length && list.every((x) => x && typeof x === 'object' && 'kind' in x && 'percent' in x)) {
+      for (const x of list) {
+        const scope = x.scope || {};
+        const who = (scope.model && scope.model.display_name) || (scope.surface && scope.surface.display_name) || '';
+        const name =
+          x.kind === 'session' && !who ? 'five_hour' : x.kind === 'weekly_all' && !who ? 'seven_day' : 'scoped:' + (x.group || '') + ':' + (who || x.kind);
+        rows.push([name, num(x.percent) / 100, isoSec(x.resets_at), x.severity]);
+      }
+    } else {
+      for (const k of LEGACY_WINDOWS) if (isWindow(o[k])) rows.push([k, num(o[k].utilization) / 100, isoSec(o[k].resets_at)]);
+      for (const x of Array.isArray(o.model_scoped) ? o.model_scoped : []) {
+        if (x && x.display_name && 'utilization' in x) rows.push(['scoped:weekly:' + x.display_name, num(x.utilization) / 100, isoSec(x.resets_at)]);
+      }
     }
+    const ex = o.extra_usage;
+    const hasExtra = !!ex && typeof ex === 'object' && 'is_enabled' in ex;
+    if (!rows.length && !hasExtra) return false;
+    let changed = false;
+    for (const [name, u, resetsAt, severity] of rows) {
+      if (resetsAt || !u) changed = mergeLimit(name, u, resetsAt, { src: 'official', severity, at }) || changed;
+    }
+    if (hasExtra && at) {
+      // 金额以货币的最小单位计（美元就是美分）
+      extraUsage = { enabled: !!ex.is_enabled, limit: num(ex.monthly_limit), used: num(ex.used_credits), currency: ex.currency || 'USD', at };
+      lsSet('ctm-extra', JSON.stringify(extraUsage));
+    }
+    if (at) officialAt = Math.max(officialAt, at);
+    saveLimits();
+    return true;
   }
 
   // 其他 claude.ai 标签页看到的额度也合并进来
   W.addEventListener('storage', (e) => {
-    if (e.key !== 'ctm-limits' || !e.newValue) return;
+    if (!e.newValue) return;
     try {
-      recordLimits({ unifiedWindows: JSON.parse(e.newValue) });
+      if (e.key === 'ctm-limits') {
+        const other = JSON.parse(e.newValue) || {};
+        let changed = false;
+        for (const name in other) {
+          const x = other[name] || {};
+          changed = mergeLimit(name, num(x.utilization), num(x.resetsAt), { ...x, at: num(x.at) }) || changed;
+        }
+        if (changed) dirty = true;
+      } else if (e.key === 'ctm-extra') {
+        extraUsage = JSON.parse(e.newValue);
+        dirty = true;
+      }
     } catch {}
   });
 
@@ -302,6 +565,32 @@
     return isFinite(t) && t > 0 ? t : 0;
   }
 
+  function handleSystem(o, ctx) {
+    switch (o.subtype) {
+      case 'init':
+        if (isModelId(o.model)) addInfo('model', o.model, 'init', ctx);
+        if ('effort' in o) addInfo('effort', o.effort, 'init', ctx);
+        if (o.fast_mode_state) addInfo('fast', o.fast_mode_state, 'init', ctx);
+        break;
+      case 'thinking_tokens':
+        thinkingProgress(o, ctx);
+        break;
+      case 'model_refusal_fallback':
+        if (o.scope !== 'local' && isModelId(o.fallback_model)) addInfo('model', o.fallback_model, 'fallback', ctx);
+        break;
+      case 'compact_boundary': {
+        // 压缩之后、下一次请求之前，上下文就是压缩后的大小
+        const post = num((o.compact_metadata || {}).post_tokens);
+        if (post) addInfo('ctx', { used: post, max: 0 }, 'compact', ctx);
+        break;
+      }
+      case 'session_metadata':
+        if (o.metadata && typeof o.metadata === 'object') applyMetadata(o.metadata, ctx);
+        break;
+    }
+    return true;
+  }
+
   function handle(o, ctx) {
     switch (o.type) {
       case 'message_start': {
@@ -310,7 +599,11 @@
         closeLane(lane);
         const m = messageRecord(msg.id || 'anon-' + ++state.anon, ctx, lane);
         if (msg.usage) recordUsage(m, msg.usage, false);
-        state.lanes.set(lane, { m, bulk: ctx.bulk, t0: performance.now(), first: 0, last: 0, est: 0, exact: 0, thinking: false });
+        if (isModelId(msg.model)) {
+          m.model = msg.model;
+          if (lane === 'main') addInfo('served', msg.model, 'stream', ctx);
+        }
+        state.lanes.set(lane, newLane(m, ctx.bulk));
         return true;
       }
       case 'content_block_start': {
@@ -329,14 +622,14 @@
         if (!s.first) s.first = now;
         s.last = now;
         s.est += n;
-        s.m.streamEst = s.est;
+        if (s.m) s.m.streamEst = s.est;
         state.samples.push([now, n]);
         dirty = true;
         return true;
       }
       case 'message_delta': {
         const s = state.lanes.get(laneOf(ctx));
-        if (!s || !o.usage) return true;
+        if (!s || !s.m || !o.usage) return true;
         recordUsage(s.m, o.usage, true);
         const exact = num(o.usage.output_tokens);
         if (exact && !s.bulk && !ctx.bulk) {
@@ -353,10 +646,20 @@
         closeLane(laneOf(ctx), performance.now());
         return true;
       case 'assistant': {
+        // /context、/usage 的结果是 CLI 自己生成的消息，结构化的数据挂在消息外层
+        if (o.context_usage && typeof o.context_usage === 'object') handle(o.context_usage, ctx);
+        if (o.usage_report && o.usage_report.rate_limits && typeof o.usage_report.rate_limits === 'object') {
+          recordOfficial(o.usage_report.rate_limits, ctx.bulk ? ctx.ts || 0 : Date.now());
+        }
         const msg = o.message;
-        if (!msg || !msg.usage) return true;
-        const m = messageRecord(msg.id || o.uuid, ctx, o.parent_tool_use_id || 'main');
+        if (!msg || !msg.usage || (typeof msg.model === 'string' && msg.model[0] === '<')) return true;
+        const lane = o.parent_tool_use_id || 'main';
+        const m = messageRecord(msg.id || o.uuid, ctx, lane);
         recordUsage(m, msg.usage, false);
+        if (isModelId(msg.model)) {
+          m.model = msg.model;
+          if (lane === 'main') addInfo('served', msg.model, 'assistant', ctx);
+        }
         for (const b of msg.content || []) {
           if (!b) continue;
           const s = blockText(b);
@@ -372,20 +675,70 @@
       case 'result':
         recordResult(o, ctx);
         return true;
+      case 'system':
+        return handleSystem(o, ctx);
+      case 'conversation_reset': {
+        // /clear：累计值从零重新开始，之前的上下文也作废了
+        const z = stamp(ctx);
+        state.resets.push(z);
+        if (ctx.batch) ctx.batch.push(z);
+        state.rev++;
+        dirty = true;
+        return true;
+      }
+      case 'control_request':
+        if (o.request && typeof o.request === 'object') handleRequest(o.request, ctx);
+        return true;
       case 'rate_limit_event':
-        recordLimits(o.rate_limit_info);
+        recordLimits(o.rate_limit_info, ctx);
         recordReadings(o.rate_limit_info, ctx);
         return true;
       default: {
         if (o.rate_limit_info && typeof o.rate_limit_info === 'object') {
-          recordLimits(o.rate_limit_info);
+          recordLimits(o.rate_limit_info, ctx);
           recordReadings(o.rate_limit_info, ctx);
           return true;
         }
+        // get_context_usage 的响应
         if (typeof o.totalTokens === 'number' && typeof o.maxTokens === 'number' && 'percentage' in o) {
-          state.ctxUsage = { ...stamp(ctx), used: o.totalTokens, max: o.maxTokens };
-          dirty = true;
+          addInfo('ctx', { used: o.totalTokens, max: o.maxTokens, compactAt: num(o.autoCompactThreshold) }, 'query', ctx);
+          if (isModelId(o.model)) addInfo('model', o.model, 'context', ctx);
           return true;
+        }
+        // /context 结果的结构化数据
+        if (typeof o.total_tokens === 'number' && typeof o.raw_max_tokens === 'number' && 'percentage' in o) {
+          addInfo('ctx', { used: o.total_tokens, max: o.raw_max_tokens }, 'query', ctx);
+          if (isModelId(o.model)) addInfo('model', o.model, 'context', ctx);
+          return true;
+        }
+        // get_settings 的响应：applied 是会话实际生效的模型和推理强度
+        const ap = o.applied;
+        if (ap && typeof ap === 'object' && ('effort' in ap || 'ultracode' in ap)) {
+          if (isModelId(ap.model)) addInfo('model', ap.model, 'settings', ctx);
+          if ('effort' in ap) addInfo('effort', ap.effort, 'settings', ctx);
+          if ('ultracode' in ap) addInfo('ultracode', ap.ultracode === true, 'settings', ctx);
+          return true;
+        }
+        // 会话对象（云端会话）
+        const md = o.external_metadata;
+        if (md && typeof md === 'object' && !Array.isArray(md)) {
+          if (isCurrentSession(o)) {
+            applyMetadata(md, ctx);
+            const sc = o.session_context;
+            if (sc && isModelId(sc.model)) addInfo('model', sc.model, 'session', ctx);
+          }
+          return true;
+        }
+        if (o.subtype === 'set_model' || o.subtype === 'apply_flag_settings') {
+          handleRequest(o, ctx);
+          return true;
+        }
+        // claude.ai 用量接口、get_usage 的响应
+        if (
+          (Array.isArray(o.limits) && o.limits.length && o.limits[0] && 'percent' in o.limits[0]) ||
+          LEGACY_WINDOWS.some((k) => isWindow(o[k]))
+        ) {
+          return recordOfficial(o, ctx.bulk ? ctx.ts || 0 : Date.now());
         }
         const u = o.usage;
         if (u && typeof u === 'object' && ('output_tokens' in u || 'input_tokens' in u) && (o.id || o.uuid)) {
@@ -395,6 +748,34 @@
         return false;
       }
     }
+  }
+
+  // 对话内容（用户消息、工具调用与结果、正文块）里可能有看起来像事件的 JSON（比如读到的日志文件），不往里找
+  const CONTENT_TYPES = new Set([
+    'user',
+    'text',
+    'thinking',
+    'redacted_thinking',
+    'tool_use',
+    'tool_result',
+    'server_tool_use',
+    'mcp_tool_use',
+    'mcp_tool_result',
+    'web_search_tool_result',
+    'web_fetch_tool_result',
+    'code_execution_tool_result',
+    'bash_code_execution_tool_result',
+    'document',
+    'image',
+    'tool_progress',
+    'tool_use_summary',
+    'prompt_suggestion',
+  ]);
+  const NESTED_JSON = /tokens|delta|_start|_stop|rate_limit|"model"|effort|utilization|"subtype"/i;
+
+  function countType(o) {
+    const k = typeof o.type === 'string' ? o.type.slice(0, 40) + (typeof o.subtype === 'string' ? '/' + o.subtype.slice(0, 40) : '') : '';
+    if (k && (k in state.types || Object.keys(state.types).length < 150)) state.types[k] = (state.types[k] || 0) + 1;
   }
 
   function walk(o, ctx, depth) {
@@ -417,12 +798,16 @@
       }
       if (o.type === 'stream_event') ctx.lane = o.parent_tool_use_id || 'main';
     }
-    if (o.type && debug) log(ctx.bulk ? '(history)' : '(live)', o.type, o.event?.type || o.delta?.type || '');
-    if (handle(o, ctx)) return;
+    if (o.type) {
+      countType(o);
+      if (debug) log(ctx.bulk ? '(history)' : '(live)', o.type, o.subtype || o.event?.type || o.delta?.type || '');
+    }
+    if (handle(o, ctx) || CONTENT_TYPES.has(o.type)) return;
     for (const k in o) {
+      if (k === 'tool_use_result') continue; // 工具结果的结构化副本
       const v = o[k];
       if (v && typeof v === 'object') walk(v, ctx, depth + 1);
-      else if (typeof v === 'string' && v.length > 20 && (v[0] === '{' || v[0] === '[') && /tokens|delta|_start|_stop|rate_limit/i.test(v)) {
+      else if (typeof v === 'string' && v.length > 20 && (v[0] === '{' || v[0] === '[') && NESTED_JSON.test(v)) {
         try {
           walk(JSON.parse(v), ctx, depth + 1);
         } catch {}
@@ -447,7 +832,10 @@
     const bulk = acc.n > 2;
     const batch = bulk ? [] : null; // 这批历史记录里新建的记录，按出现顺序
     walk(obj, { bulk, src, batch }, 0);
-    if (batch) fillBatchTimes(batch);
+    if (batch && batch.length) {
+      fillBatchTimes(batch);
+      sortResults(); // 时间戳补齐之后先后可能变了
+    }
   }
 
   // 历史记录里有些事件自己没有时间戳（比如 rate_limit_event）。同一批数据里事件的先后是可靠的，
@@ -472,14 +860,32 @@
     } catch {}
   }
 
+  // message_stop、content_block_start、rate_limit_event 里没有 tokens；会话对象、用量接口里也不一定有
+  const WORTH_PARSING = /tokens|_delta|_start|_stop|rate_limit|external_metadata|effort|utilization|conversation_reset|"subtype"/i;
+
   function ingestText(text, src) {
     if (typeof text !== 'string' || !text || text.length > 50e6) return;
-    if (!/tokens|_delta|_start|_stop|rate_limit/i.test(text)) return; // message_stop、content_block_start、rate_limit_event 里没有 tokens
+    if (!WORTH_PARSING.test(text)) return;
     try {
       ingestObj(JSON.parse(text), src);
       return;
     } catch {}
     for (const line of text.split('\n')) ingestLine(line, src);
+  }
+
+  // 网页发出去的数据只看切换模型、改推理强度这两种控制请求，别的一概不碰
+  function ingestOutgoing(body) {
+    if (typeof body !== 'string' || body.length > 2e6 || !/set_model|apply_flag_settings/.test(body)) return;
+    try {
+      findRequests(JSON.parse(body), 0);
+    } catch {}
+  }
+
+  function findRequests(o, depth) {
+    if (!o || typeof o !== 'object' || depth > 8 || CONTENT_TYPES.has(o.type)) return;
+    if (Array.isArray(o)) return void o.forEach((v) => findRequests(v, depth + 1));
+    if (o.subtype === 'set_model' || o.subtype === 'apply_flag_settings') return void handleRequest(o, { src: 'out' });
+    for (const k in o) if (o[k] && typeof o[k] === 'object') findRequests(o[k], depth + 1);
   }
 
   function safe(fn) {
@@ -494,51 +900,123 @@
 
   // ---------------------------------------------------------------- 统计
 
+  // 累计值在 /clear 之后、或者续接时没有存档的情况下会从零重新开始。按先后把 result 分成几段（同一段里
+  // 累计值只增不减），各段最后一条相加才是整个会话的用量
+  let runsCache = null;
+  function runs() {
+    if (runsCache && runsCache.state === state && runsCache.rev === state.rev) return runsCache.list;
+    const list = [];
+    let cur = null;
+    let prev = null;
+    for (const r of state.results) {
+      if (prev && sameResult(prev, r)) continue; // 同一条 result 从两个通道各来了一次，或者是没有请求的一轮
+      if (!prev || restarted(prev, r)) list.push((cur = []));
+      cur.push(r);
+      prev = r;
+    }
+    runsCache = { state, rev: state.rev, list };
+    return list;
+  }
+
+  function sameResult(a, b) {
+    if (Math.abs(a.cost - b.cost) > 1e-9 || !a.totals !== !b.totals) return false;
+    return !a.totals || KINDS.every((k) => a.totals[k] === b.totals[k]);
+  }
+
+  function restarted(p, r) {
+    if (r.cost < p.cost - 1e-6) return true;
+    if (p.totals && r.totals) {
+      for (const k of KINDS) if (r.totals[k] < p.totals[k]) return true;
+      for (const name in p.byModel) if (!r.byModel[name]) return true; // 某个模型的累计值不见了
+    }
+    return state.resets.some((z) => isAfter(z, p) && isAfter(r, z)); // 两条之间有 /clear
+  }
+
   function sessionTotals() {
-    let base = null; // 最新一条带 modelUsage 的 result
-    for (let i = state.results.length - 1; i >= 0 && !base; i--) if (state.results[i].totals) base = state.results[i];
-    const t = base ? { ...base.totals } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-    t.approx = false;
+    const t = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, thinking: 0, cost: 0, approx: false, approxCost: false, runs: 0, models: {} };
+    let base = null; // 最后一条 result
+    for (const run of runs()) {
+      const r = run[run.length - 1];
+      t.runs++;
+      t.cost += r.cost;
+      t.thinking += r.thinking;
+      if (r.totals) for (const k of KINDS) t[k] += r.totals[k];
+      for (const name in r.byModel) {
+        const s = (t.models[modelName(name) || name] ||= { cost: 0, output: 0 });
+        s.cost += r.byModel[name].cost;
+        s.output += r.byModel[name].output;
+      }
+      base = r;
+    }
+    // 本轮还没结束的请求：用量按事件累加，费用按上一段的平均单价估算
+    let pending = 0;
     for (const m of state.messages.values()) {
       if (base && !isAfter(m, base)) continue; // 已计入 result 的累计值
+      const out = messageOutput(m);
       t.input += m.input;
-      t.output += messageOutput(m);
+      t.output += out;
       t.cacheRead += m.cacheRead;
       t.cacheWrite += m.cacheWrite;
+      pending += weightOf(m, out);
       if (!m.exact) t.approx = true;
     }
+    if (pending && base && base.totals && base.cost) {
+      t.cost += (base.cost / weightOf(base.totals, base.totals.output)) * pending;
+      t.approxCost = true;
+    }
+    t.requests = state.messages.size;
     return t;
   }
 
   // 上一轮：输出 token 数与平均速度
   function lastTurn() {
-    const rs = state.results;
-    const cur = rs[rs.length - 1];
-    if (!cur) return null;
-    const prev = rs[rs.length - 2];
-    // usage.output_tokens 应是本轮值；再和累计值之差取小者，哪种语义都不会算多
-    const delta = prev && prev.totals && cur.totals ? cur.totals.output - prev.totals.output : 0;
-    const tokens = cur.turnOut > 0 && delta > 0 ? Math.min(cur.turnOut, delta) : cur.turnOut || Math.max(delta, 0);
+    const list = runs();
+    const run = list[list.length - 1];
+    if (!run) return null;
+    const cur = run[run.length - 1];
+    const prev = run[run.length - 2];
+    let tokens = cur.turn.output;
+    let ms = 0;
+    if (prev) {
+      // 同一段里相邻两条之差：本轮全部请求（含子代理）的输出和 API 耗时
+      if (cur.totals && prev.totals && cur.totals.output > prev.totals.output) tokens = cur.totals.output - prev.totals.output;
+      ms = cur.apiMs - prev.apiMs;
+    } else if (cur.apiMs <= cur.wallMs * 1.1) ms = cur.apiMs; // 一段的第一条：duration_api_ms 不超过本轮时长时可能就是本轮的
     if (!tokens) return null;
-    // duration_api_ms 是累计 API 耗时：优先取与上一条之差；本轮 API 耗时不会明显超过本轮总耗时
-    // （留 10% 余量：轮次之间的后台小请求会被算进下一轮）
-    for (const ms of [prev ? cur.apiMs - prev.apiMs : 0, cur.apiMs]) {
-      if (ms > 0 && (!cur.wallMs || ms <= cur.wallMs * 1.1)) return { tokens, ms, speed: tokens / (ms / 1000) };
-    }
-    return { tokens, ms: 0, speed: null };
+    return ms > 0 ? { tokens, ms, speed: tokens / (ms / 1000) } : { tokens, ms: 0, speed: null };
   }
 
-  // 当前上下文：主对话最近一次请求的输入（含缓存）
-  function contextNow() {
+  function latestOf(list, weight) {
     let best = null;
-    const consider = (x, used) => {
-      if (used > 0 && (!best || isAfter(x, best.x) || (!isAfter(best.x, x) && used > best.used))) best = { x, used };
-    };
-    for (const m of state.messages.values()) if (m.lane === 'main') consider(m, messageContext(m));
-    if (state.ctxUsage) consider(state.ctxUsage, state.ctxUsage.used);
+    for (const x of list) if (!best || compare(x, best, weight) > 0) best = x;
+    return best;
+  }
+
+  // 当前模型的上下文窗口：最近一条 result 里这个模型的 contextWindow；对不上时取最大的
+  function windowFor(id) {
     const r = state.results[state.results.length - 1];
-    const max = (state.ctxUsage && state.ctxUsage.max) || (r && r.window) || 0;
-    return best ? { used: best.used, max } : null;
+    if (!r) return 0;
+    const want = modelName(id).replace(/ 1M$/, '');
+    for (const name in r.byModel) if (want && modelName(name).replace(/ 1M$/, '') === want && r.byModel[name].window) return r.byModel[name].window;
+    return r.window;
+  }
+
+  // 当前上下文：主对话最近一次请求的输入（含缓存），或者更新的明确读数（上下文查询、会话元数据、压缩边界）；/clear 之前的不算
+  function contextNow() {
+    const cut = latestOf(state.resets, (x) => x.seq);
+    let best = null;
+    const consider = (x, used, max) => {
+      if (used <= 0 || (cut && !isAfter(x, cut))) return;
+      if (!best || isAfter(x, best.x) || (!isAfter(best.x, x) && used > best.used)) best = { x, used, max };
+    };
+    for (const m of state.messages.values()) if (m.lane === 'main') consider(m, messageContext(m), 0);
+    let compactAt = 0;
+    for (const x of state.info.ctx || []) {
+      consider(x, num(x.value.used), num(x.value.max));
+      if (num(x.value.compactAt)) compactAt = x.value.compactAt;
+    }
+    if (!best) return null;
+    return { used: best.used, max: best.max || windowFor(modelInfo().id), compactAt, src: best.x.src || 'request' };
   }
 
   // ---------------------------------------------------------------- 额度折合多少钱
@@ -579,24 +1057,31 @@
     for (const r of state.results) if (orderKey(r) != null) items.push([orderKey(r), 1, r]);
     for (const q of state.readings) if (orderKey(q) != null) items.push([orderKey(q), 2, q]);
     items.sort((a, b) => a[0] - b[0]);
+    const prevOf = new Map(); // result -> 同一段里的上一条（段落第一条为 null；重复的 result 不在里面）
+    for (const run of runs()) run.forEach((r, i) => prevOf.set(r, i ? run[i - 1] : null));
 
     // 第一遍：按 result 分轮，把每轮的花费按 token 权重分到各次请求上
     const cost = new Map();
     let pending = [];
-    let prev = null;
     let scale = 0; // 每单位权重折合的美元，用最近一轮校准，估算还没结束的这一轮
     let apiSec = 0;
     let apiCost = 0;
     for (const [, kind, x] of items) {
       if (kind === 0) pending.push(x);
-      if (kind !== 1) continue;
-      // 本轮花费优先用相邻两条 result 的累计费用之差；和按本轮用量算的差太多（漏了 result、/clear 过）就用后者
-      const unit = x.totals ? x.cost / weightOf(x.totals, x.totals.output) : 0;
-      const byUsage = unit * weightOf(x.turn, x.turn.output);
-      let turnCost = prev && x.cost > prev.cost ? x.cost - prev.cost : 0;
-      if (byUsage && !(turnCost > byUsage / 1.5 && turnCost < byUsage * 1.5)) turnCost = byUsage;
+      if (kind !== 1 || !prevOf.has(x)) continue;
+      const p = prevOf.get(x);
+      // 本轮花费：同一段里相邻两条 result 的累计费用之差，包括子代理、压缩等本轮的全部请求。
+      // 一段的第一条没有可比的上一条，只能按本轮用量估算；result.usage 只含主对话，所以本轮有子代理时不估
+      let turnCost = 0;
+      let outTotal = x.turn.output;
+      if (p) {
+        turnCost = Math.max(0, x.cost - p.cost);
+        if (x.totals && p.totals) outTotal = Math.max(0, x.totals.output - p.totals.output);
+      } else if (x.totals && pending.every((m) => m.lane === 'main')) {
+        turnCost = (x.cost / weightOf(x.totals, x.totals.output)) * weightOf(x.turn, x.turn.output);
+      }
       // 本轮的输出数分到各次请求：有精确值的直接用，其余按正文长度和思考签名长度分
-      const rest = Math.max(0, x.turnOut - pending.reduce((s, m) => s + (m.exact ? m.output : 0), 0));
+      const rest = Math.max(0, outTotal - pending.reduce((s, m) => s + (m.exact ? m.output : 0), 0));
       const share = (m) => (m.exact ? 0 : m.blockEst + SIG_TOKENS * m.sig + 1);
       const shares = pending.reduce((s, m) => s + share(m), 0);
       const w = pending.map((m) => weightOf(m, m.exact ? m.output : (rest * share(m)) / shares));
@@ -605,15 +1090,12 @@
         pending.forEach((m, i) => cost.set(m, (turnCost * w[i]) / total));
         scale = turnCost / total;
       }
-      // 模型运行时间：duration_api_ms 是累计值，取差；本轮 API 时间不会明显超过本轮总时长
-      for (const ms of [prev ? x.apiMs - prev.apiMs : 0, x.apiMs]) {
-        if (turnCost && ms > 0 && (!x.wallMs || ms <= x.wallMs * 1.1)) {
-          apiSec += ms / 1000;
-          apiCost += turnCost;
-          break;
-        }
+      // 模型运行时间：duration_api_ms 是累计值，取同一段里的差；一段的第一条只在不超过本轮时长时才当作本轮的
+      const ms = p ? x.apiMs - p.apiMs : x.apiMs <= x.wallMs * 1.1 ? x.apiMs : 0;
+      if (turnCost && ms > 0) {
+        apiSec += ms / 1000;
+        apiCost += turnCost;
       }
-      prev = x;
       pending = [];
     }
     if (scale) {
@@ -710,12 +1192,11 @@
 
   // 每个会话的估算按会话路径存进 localStorage，显示时把最近各会话的结果合起来，
   // 这样换到新会话也能立刻看到，用得越多越准
-  // v3：之前版本存的 7 天额度估算会被读数抖动和别处的使用带偏，直接丢弃
-  const RATE_KEY = 'ctm-rates-v3';
+  // v4：之前版本在子代理较多的轮次里把本轮花费算少了，估出的单价偏低，直接丢弃
+  const RATE_KEY = 'ctm-rates-v4';
   let rateStore = {};
   try {
-    localStorage.removeItem('ctm-rates');
-    localStorage.removeItem('ctm-rates-v2');
+    for (const k of ['ctm-rates', 'ctm-rates-v2', 'ctm-rates-v3']) localStorage.removeItem(k);
     rateStore = JSON.parse(lsGet(RATE_KEY) || '{}') || {};
   } catch {}
   let quotaCache = null;
@@ -798,6 +1279,12 @@
 
   const TAP_TYPES = /json|event-stream|ndjson|text\/plain/i;
   const STREAM_TYPES = /event-stream|ndjson|jsonl/i;
+  let orgId = ''; // 当前组织，查询用量接口要用
+
+  function noteUrl(url) {
+    const m = /\/api\/organizations\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(url || '');
+    if (m) orgId = m[1];
+  }
 
   async function readStream(body, src) {
     const reader = body.getReader();
@@ -818,13 +1305,17 @@
 
   const origFetch = W.fetch;
   if (origFetch) {
-    W.fetch = function (input) {
+    W.fetch = function (input, init) {
+      const url = typeof input === 'string' ? input : input && (input.url || String(input));
+      safe(() => {
+        noteUrl(url);
+        if (init && typeof init.body === 'string') ingestOutgoing(init.body);
+      })();
       const p = origFetch.apply(this, arguments);
       p.then(
         safe((res) => {
           const ct = res.headers.get('content-type') || '';
           if (!res.body || !TAP_TYPES.test(ct)) return;
-          const url = typeof input === 'string' ? input : input && input.url;
           const copy = res.clone();
           log('fetch', ct, url);
           if (STREAM_TYPES.test(ct)) readStream(copy.body, url).catch(() => {});
@@ -838,8 +1329,14 @@
 
   const XHR = W.XMLHttpRequest && W.XMLHttpRequest.prototype;
   if (XHR) {
+    const origOpen = XHR.open;
+    XHR.open = function (method, url) {
+      safe(noteUrl)(String(url));
+      return origOpen.apply(this, arguments);
+    };
     const origSend = XHR.send;
-    XHR.send = function () {
+    XHR.send = function (body) {
+      safe(ingestOutgoing)(body);
       let pos = 0;
       let buf = '';
       const xhr = this;
@@ -877,6 +1374,11 @@
       const ws = protocols === undefined ? new OrigWS(url) : new OrigWS(url, protocols);
       log('websocket', url);
       ws.addEventListener('message', safe((e) => ingestBinaryOrText(e.data, 'ws')));
+      const send = ws.send;
+      ws.send = function (data) {
+        safe(ingestOutgoing)(data);
+        return send.apply(this, arguments);
+      };
       return ws;
     };
     WS.prototype = OrigWS.prototype;
@@ -926,6 +1428,93 @@
   }
   W.addEventListener('popstate', onNav);
 
+  // ---------------------------------------------------------------- 主动刷新额度
+
+  // 额度读数平时只随请求更新：两轮之间、在别的设备上用过之后都会过时，窗口重置后也要等下一次请求。
+  // claude.ai 设置里的用量页面有个只读接口，这里低频地查一下：页面可见时每 3 分钟，一轮结束后、展开面板时
+  // 最多每分钟一次；多个标签页共用一次结果。连续失败 3 次就停下（接口变了），可以在面板底部关掉
+  const POLL_MS = 180000;
+  let pollOn = lsGet('ctm-poll') !== '0';
+  let pollFails = 0;
+  let pollBusy = false;
+  let pollAt = 0;
+  let pollErr = '';
+
+  function currentOrg() {
+    if (orgId) return orgId;
+    const m = /(?:^|;\s*)lastActiveOrg=([0-9a-f-]{36})/i.exec(document.cookie || '');
+    return m ? m[1] : '';
+  }
+
+  async function pollUsage(soon) {
+    if (!pollOn || pollBusy || pollFails >= 3 || !origFetch || document.visibilityState === 'hidden') return;
+    const now = Date.now();
+    if (now - Math.max(pollAt, +lsGet('ctm-poll-at') || 0) < (soon ? 60000 : POLL_MS)) return;
+    const org = currentOrg();
+    if (!org) return;
+    pollBusy = true;
+    pollAt = now;
+    lsSet('ctm-poll-at', String(now));
+    try {
+      const res = await origFetch.call(W, '/api/organizations/' + org + '/usage', {
+        credentials: 'include',
+        headers: { accept: 'application/json' },
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      if (!recordOfficial(await res.json(), Date.now())) throw new Error('无法识别的返回格式');
+      pollFails = 0;
+      pollErr = '';
+      log('usage poll ok');
+    } catch (e) {
+      pollFails++;
+      pollErr = String((e && e.message) || e);
+      log('usage poll failed', e);
+    } finally {
+      pollBusy = false;
+      dirty = true;
+    }
+  }
+  document.addEventListener('visibilitychange', () => pollUsage(false));
+
+  // ---------------------------------------------------------------- 诊断
+
+  function diagnostics() {
+    const pick = (k) => {
+      const x = latestInfo(k);
+      return x ? { value: x.value === undefined ? null : x.value, src: x.src, live: x.live } : null;
+    };
+    return {
+      version: VERSION,
+      time: new Date().toISOString(),
+      page: location.pathname.replace(/[A-Za-z0-9_-]{16,}/g, '<id>'),
+      model: pick('model'),
+      served: pick('served'),
+      effort: pick('effort'),
+      fast: pick('fast'),
+      ultracode: pick('ultracode'),
+      runs: runs().map((run) => {
+        const r = run[run.length - 1];
+        return { results: run.length, cost: +r.cost.toFixed(4), totals: r.totals, models: Object.keys(r.byModel) };
+      }),
+      totals: sessionTotals(),
+      lastTurn: lastTurn(),
+      context: contextNow(),
+      limits,
+      extraUsage,
+      quota: quotaRates(),
+      poll: { on: pollOn, fails: pollFails, error: pollErr, org: !!currentOrg(), at: pollAt ? new Date(pollAt).toISOString() : null },
+      counts: {
+        messages: state.messages.size,
+        results: state.results.length,
+        readings: state.readings.length,
+        resets: state.resets.length,
+        lanes: state.lanes.size,
+      },
+      calib: +state.calib.toFixed(3),
+      types: state.types,
+    };
+  }
+
   // ---------------------------------------------------------------- UI
 
   const fmt = (n) => {
@@ -936,9 +1525,22 @@
   };
   const fmtSpeed = (s) => (s == null ? '–' : s.toFixed(1));
   const fmtPct = (f) => Math.round(f * 100) + '%';
-  const fmtCost = (c, short) => '$' + c.toFixed(short ? (c < 0.1 ? 3 : 2) : c >= 10 ? 2 : 4);
+  const fmtCost = (c, short) => '$' + c.toFixed(c >= 1 || (short && c >= 0.1) ? 2 : short || c >= 0.1 ? 3 : 4);
   const fmtUsd = (v, precise) => '$' + (precise ? v.toFixed(2) : v >= 10 ? Math.round(v).toLocaleString() : v.toFixed(1));
   const fmtHours = (h) => (h < 1 ? Math.max(1, Math.round(h * 60)) + ' 分钟' : (h < 10 ? h.toFixed(1) : Math.round(h)) + ' 小时');
+
+  // 时长：45 秒、4 分 31 秒、1 小时 5 分
+  function fmtDur(ms) {
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 60) return s + ' 秒';
+    if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
+    return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分';
+  }
+
+  function fmtAgo(ms) {
+    const m = Math.round((Date.now() - ms) / 60000);
+    return m < 1 ? '刚刚' : m < 60 ? m + ' 分钟前' : m < 1440 ? Math.round(m / 60) + ' 小时前' : Math.round(m / 1440) + ' 天前';
+  }
 
   function fmtReset(sec) {
     const d = new Date(sec * 1000);
@@ -959,26 +1561,30 @@
   // 颜色取自 dataviz 参考调色板：浅色、深色各自选定的墨色与表面色；状态色固定，不随主题变
   const THEMES = {
     light: {
-      surface: 'rgba(252,252,251,0.96)',
+      surface: 'rgba(252,252,251,0.97)',
       ink: '#0b0b0b',
       ink2: '#52514e',
       muted: '#898781',
       hair: 'rgba(11,11,11,0.10)',
-      control: 'rgba(11,11,11,0.18)',
-      shadow: '0 4px 16px rgba(0,0,0,0.12)',
+      control: 'rgba(11,11,11,0.06)',
+      shadow: '0 6px 24px rgba(0,0,0,0.12), 0 1px 3px rgba(0,0,0,0.08)',
       accent: '#2a78d6',
-      trackAlpha: 0.18,
+      chipBg: 'rgba(42,120,214,0.12)',
+      chipInk: '#1f62b5',
+      trackAlpha: 0.16,
     },
     dark: {
-      surface: 'rgba(26,26,25,0.94)',
+      surface: 'rgba(30,30,29,0.96)',
       ink: '#f0efec',
       ink2: '#c3c2b7',
-      muted: '#898781',
+      muted: '#8f8d86',
       hair: 'rgba(255,255,255,0.10)',
-      control: 'rgba(255,255,255,0.18)',
-      shadow: '0 4px 20px rgba(0,0,0,0.45)',
+      control: 'rgba(255,255,255,0.08)',
+      shadow: '0 8px 28px rgba(0,0,0,0.5)',
       accent: '#3987e5',
-      trackAlpha: 0.28,
+      chipBg: 'rgba(57,135,229,0.22)',
+      chipInk: '#9cc4f7',
+      trackAlpha: 0.26,
     },
   };
   const STATUS = { good: '#0ca30c', warning: '#fab219', critical: '#d03b3b' };
@@ -1022,25 +1628,81 @@
     if (name === themeName) return;
     themeName = name;
     theme = THEMES[name];
-    for (const k in theme) if (typeof theme[k] === 'string') ui.root.style.setProperty('--ctm-' + k, theme[k]);
+    for (const k in theme) if (typeof theme[k] === 'string') ui.root.style.setProperty('--' + k, theme[k]);
     ui.root.style.colorScheme = name;
     pillKey = '';
     dirty = true;
   }
 
-  function el(tag, style, text) {
+  // 面板放在 shadow DOM 里，和页面的样式互不影响。样式表用 adoptedStyleSheets 加载，不受页面 CSP 对内联样式的限制
+  const CSS = `
+    .root { font: 12px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink); background: var(--surface); border: 1px solid var(--hair); border-radius: 12px;
+      box-shadow: var(--shadow); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+      user-select: none; -webkit-user-select: none; font-variant-numeric: tabular-nums; letter-spacing: normal;
+      text-align: left; overflow: hidden; }
+    .root.compact { border-radius: 999px; }
+    .pill { display: none; align-items: center; gap: 7px; padding: 4px 12px 4px 10px; cursor: pointer; white-space: nowrap; }
+    .compact .pill { display: flex; }
+    .full { display: none; width: 268px; }
+    .root:not(.compact) .full { display: block; }
+    .pill-text { display: flex; align-items: center; gap: 6px; }
+    .pill-text b { font-weight: 600; }
+    .muted { color: var(--muted); }
+    .sq { display: inline-block; width: 7px; height: 7px; border-radius: 2px; margin-right: 4px; vertical-align: 1px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; transition: opacity .3s, background-color .3s; }
+    .head { display: flex; align-items: center; gap: 8px; padding: 7px 6px 7px 12px; cursor: move; border-bottom: 1px solid var(--hair); }
+    .title { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; }
+    .model { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+    .chips { display: flex; gap: 4px; flex: none; }
+    .chip { font-size: 11px; line-height: 17px; padding: 0 7px; border-radius: 999px; background: var(--chipBg);
+      color: var(--chipInk); font-weight: 500; white-space: nowrap; }
+    .chip.alt { background: var(--control); color: var(--ink2); }
+    .icon { flex: none; width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0;
+      border-radius: 6px; background: transparent; color: var(--ink2); font: 14px/1 system-ui, sans-serif; cursor: pointer; }
+    .icon:hover { background: var(--control); color: var(--ink); }
+    button:focus-visible, .pill:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .body { padding: 10px 12px; }
+    .hero { display: flex; align-items: baseline; gap: 5px; }
+    .big { font-size: 22px; line-height: 26px; font-weight: 600; letter-spacing: -0.02em; }
+    .big.dim { color: var(--ink2); }
+    .unit { color: var(--muted); }
+    .state { margin-left: auto; color: var(--ink2); font-size: 11px; white-space: nowrap; }
+    .cap { color: var(--muted); font-size: 11px; line-height: 16px; min-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .spark { display: block; width: 100%; height: 30px; margin-top: 6px; }
+    .rule { height: 1px; background: var(--hair); margin: 10px 0; }
+    .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .label { color: var(--ink2); white-space: nowrap; }
+    .value { text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .strong { font-weight: 600; }
+    .block { margin-bottom: 8px; }
+    .track { position: relative; height: 4px; border-radius: 2px; margin-top: 4px; }
+    .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; transition: width .4s ease; }
+    .mark { position: absolute; top: -2px; bottom: -2px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--ink2); opacity: .5; }
+    .est { color: var(--muted); font-size: 11px; line-height: 15px; text-align: right; margin-top: 3px; }
+    .grid { display: grid; grid-template-columns: auto 1fr auto 1fr; column-gap: 8px; row-gap: 1px; margin-top: 4px; }
+    .k { color: var(--ink2); white-space: nowrap; }
+    .k.second { padding-left: 8px; }
+    .v { text-align: right; white-space: nowrap; }
+    .models { color: var(--muted); font-size: 11px; line-height: 16px; margin-top: 6px; }
+    .foot { display: flex; align-items: center; gap: 2px; padding: 3px 6px; border-top: 1px solid var(--hair); font-size: 11px; color: var(--muted); }
+    .link { border: 0; background: transparent; color: inherit; font: inherit; padding: 2px 6px; border-radius: 5px; cursor: pointer; }
+    .link:hover { background: var(--control); color: var(--ink); }
+    .link.on { color: var(--accent); }
+    .ver { margin-left: auto; padding-right: 6px; }
+  `;
+
+  function h(tag, cls, text) {
     const e = document.createElement(tag);
-    if (style) Object.assign(e.style, style);
+    if (cls) e.className = cls;
     if (text != null) e.textContent = text;
     return e;
   }
 
-  const dot = () => el('span', { width: '8px', height: '8px', borderRadius: '50%', flex: 'none', transition: 'opacity .3s' });
-
   function addRow(parent, label, tip) {
-    const row = el('div', { display: 'flex', justifyContent: 'space-between', gap: '8px' });
-    const value = el('span', { color: 'var(--ctm-ink)', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }, '–');
-    row.append(el('span', { color: 'var(--ctm-ink2)', whiteSpace: 'nowrap' }, label), value);
+    const row = h('div', 'row');
+    const value = h('span', 'value', '–');
+    row.append(h('span', 'label', label), value);
     if (tip) row.title = tip;
     parent.append(row);
     return { row, value };
@@ -1048,44 +1710,57 @@
 
   // 比例条：填充色表示程度（正常用强调色，偏高用警告色，接近上限用危险色），底槽是同一色调的浅色
   function meter(parent) {
-    const track = el('div', { height: '4px', borderRadius: '2px', margin: '1px 0 5px', overflow: 'hidden' });
-    const fill = el('div', { height: '100%', width: '0', borderRadius: '2px' });
-    track.append(fill);
+    const track = h('div', 'track');
+    const fill = h('div', 'fill');
+    const mark = h('div', 'mark');
+    mark.style.display = 'none';
+    track.append(fill, mark);
     parent.append(track);
-    return { track, fill };
+    return { track, fill, mark };
   }
 
-  function setMeter(m, frac, level) {
+  function setMeter(m, frac, level, markAt) {
     const color = level === 'normal' ? theme.accent : STATUS[level];
     m.fill.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
     m.fill.style.background = color;
     m.track.style.background = tint(color, theme.trackAlpha);
+    m.mark.style.display = markAt > 0 && markAt < 1 ? 'block' : 'none';
+    m.mark.style.left = markAt * 100 + '%';
   }
 
   const levelOf = (frac, warn, crit) => (frac >= crit ? 'critical' : frac >= warn ? 'warning' : 'normal');
+  const SEVERITY = { warning: 'warning', critical: 'critical', error: 'critical' };
 
   function limitViews() {
     const now = Date.now() / 1000;
     const order = Object.keys(LIMIT_NAMES);
-    const rank = (name) => order.indexOf(name) + 1 || 99;
+    const rank = (name) => order.indexOf(name) + 1 || 50;
+    const main = (name) => name === 'five_hour' || name === 'seven_day';
     return Object.keys(limits)
-      .filter((name) => limits[name] && num(limits[name].resetsAt))
-      .sort((a, b) => rank(a) - rank(b))
+      .filter((name) => {
+        const l = limits[name];
+        if (!l) return false;
+        // 没开始的窗口只显示主要的两个；其他窗口过期一天以上就不显示了
+        if (!num(l.resetsAt)) return main(name) && !!l.at;
+        return main(name) || now - l.resetsAt < 86400;
+      })
+      .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
       .map((name) => {
         const l = limits[name];
-        const expired = now >= l.resetsAt;
-        const used = expired ? 0 : num(l.utilization);
-        const level = expired
-          ? 'normal'
-          : l.status === 'rejected' || used >= 0.9
-            ? 'critical'
-            : l.status === 'allowed_warning' || used >= 0.75
-              ? 'warning'
-              : 'normal';
-        const [label, short] = LIMIT_NAMES[name] || [name, name];
-        return { name, label, short, used, expired, level, resetsAt: l.resetsAt };
+        const idle = !num(l.resetsAt);
+        const expired = !idle && now >= l.resetsAt;
+        const used = idle || expired ? 0 : num(l.utilization);
+        const level =
+          idle || expired
+            ? 'normal'
+            : SEVERITY[l.severity] ||
+              (l.status === 'rejected' || used >= 0.9 ? 'critical' : l.status === 'allowed_warning' || used >= 0.75 ? 'warning' : 'normal');
+        const [label, short] = limitNames(name);
+        return { name, label, short, used, idle, expired, level, resetsAt: l.resetsAt, at: l.at, src: l.src };
       });
   }
+
+  const limitShort = (l) => (l.expired ? '已重置' : fmtPct(l.used));
 
   const ui = { limitRows: {} };
   let mode = lsGet('ctm-mode') === 'full' ? 'full' : 'compact';
@@ -1096,7 +1771,7 @@
   } catch {}
 
   function applyPos() {
-    const s = ui.root.style;
+    const s = ui.host.style;
     s.left = s.right = s.top = s.bottom = 'auto';
     s[pos.h] = pos.x + 'px';
     s[pos.v] = pos.y + 'px';
@@ -1104,8 +1779,8 @@
 
   // 窗口变小或面板展开后超出视口时临时收回来，不改保存的位置
   function keepInView() {
-    const r = ui.root.getBoundingClientRect();
-    const s = ui.root.style;
+    const r = ui.host.getBoundingClientRect();
+    const s = ui.host.style;
     s[pos.h] = Math.max(0, Math.min(pos.x, innerWidth - r.width)) + 'px';
     s[pos.v] = Math.max(0, Math.min(pos.y, innerHeight - r.height)) + 'px';
   }
@@ -1114,7 +1789,7 @@
   function draggable(handle, onClick) {
     handle.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
-      const r = ui.root.getBoundingClientRect();
+      const r = ui.host.getBoundingClientRect();
       const sx = e.clientX;
       const sy = e.clientY;
       let moved = false;
@@ -1124,7 +1799,7 @@
         moved = true;
         const left = Math.min(Math.max(0, r.left + ev.clientX - sx), innerWidth - r.width);
         const top = Math.min(Math.max(0, r.top + ev.clientY - sy), innerHeight - r.height);
-        Object.assign(ui.root.style, { left: left + 'px', top: top + 'px', right: 'auto', bottom: 'auto' });
+        Object.assign(ui.host.style, { left: left + 'px', top: top + 'px', right: 'auto', bottom: 'auto' });
       };
       const up = () => {
         handle.removeEventListener('pointermove', move);
@@ -1132,12 +1807,12 @@
         handle.removeEventListener('pointercancel', up);
         if (!moved) return onClick && onClick();
         // 按离得最近的角保存位置，展开、收起时朝远离这个角的方向伸缩
-        const b = ui.root.getBoundingClientRect();
-        const h = b.left + b.width / 2 > innerWidth / 2 ? 'right' : 'left';
+        const b = ui.host.getBoundingClientRect();
+        const hh = b.left + b.width / 2 > innerWidth / 2 ? 'right' : 'left';
         const v = b.top + b.height / 2 > innerHeight / 2 ? 'bottom' : 'top';
         pos = {
-          h,
-          x: Math.round(h === 'right' ? innerWidth - b.right : b.left),
+          h: hh,
+          x: Math.round(hh === 'right' ? innerWidth - b.right : b.left),
           v,
           y: Math.round(v === 'bottom' ? innerHeight - b.bottom : b.top),
         };
@@ -1154,121 +1829,156 @@
   function setMode(m) {
     mode = m;
     lsSet('ctm-mode', m);
-    ui.pill.style.display = m === 'compact' ? 'flex' : 'none';
-    ui.full.style.display = m === 'full' ? 'block' : 'none';
-    ui.root.style.borderRadius = m === 'compact' ? '999px' : '10px';
+    ui.root.classList.toggle('compact', m === 'compact');
     pillKey = '';
     paint(true);
     applyPos();
     keepInView();
+    if (m === 'full') pollUsage(true);
+  }
+
+  function copyDiagnostics() {
+    const text = JSON.stringify(diagnostics(), null, 2);
+    const done = (ok) => {
+      ui.copyBtn.textContent = ok ? '已复制' : '复制失败，已打印到控制台';
+      if (!ok) console.log(text);
+      setTimeout(() => (ui.copyBtn.textContent = '复制诊断'), 1600);
+    };
+    const fallback = () => {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      Object.assign(ta.style, { position: 'fixed', opacity: '0', top: '0' });
+      document.body.append(ta);
+      ta.select();
+      let ok = false;
+      try {
+        ok = document.execCommand('copy');
+      } catch {}
+      ta.remove();
+      done(ok);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => done(true), fallback);
+    else fallback();
   }
 
   function buildUI() {
-    const root = el('div', {
-      position: 'fixed',
-      zIndex: '2147483647',
-      background: 'var(--ctm-surface)',
-      color: 'var(--ctm-ink)',
-      font: '12px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif',
-      border: '1px solid var(--ctm-hair)',
-      boxShadow: 'var(--ctm-shadow)',
-      userSelect: 'none',
-      backdropFilter: 'blur(6px)',
-    });
-    ui.root = root;
+    const host = (ui.host = document.createElement('div'));
+    host.style.cssText = 'all: initial; display: block; position: fixed; z-index: 2147483647;'; // 不受页面样式影响
+    const shadow = host.attachShadow({ mode: 'open' });
+    try {
+      const sheet = new CSSStyleSheet();
+      sheet.replaceSync(CSS);
+      shadow.adoptedStyleSheets = [sheet];
+    } catch {
+      shadow.append(h('style', null, CSS));
+    }
+    const root = (ui.root = h('div', 'root'));
 
     // 紧凑模式：一行摘要，点击展开
-    ui.pill = el('div', {
-      alignItems: 'center',
-      gap: '6px',
-      padding: '3px 10px',
-      cursor: 'pointer',
-      whiteSpace: 'nowrap',
-      fontVariantNumeric: 'tabular-nums',
-    });
-    ui.pill.tabIndex = 0;
-    ui.pill.setAttribute('role', 'button');
-    ui.pill.title = '速度（空闲时为上轮均速）· 上下文 · 订阅额度 · API 等价费用\n点击展开，拖动可移动';
-    ui.pillDot = dot();
-    ui.pillText = el('span', { display: 'flex', alignItems: 'center', gap: '5px' });
-    ui.pill.append(ui.pillDot, ui.pillText);
-    ui.pill.addEventListener('keydown', (e) => {
+    const pill = (ui.pill = h('div', 'pill'));
+    pill.tabIndex = 0;
+    pill.setAttribute('role', 'button');
+    pill.title = '模型 · 速度（空闲时为上轮均速）· 上下文 · 订阅额度 · API 等价费用\n点击展开，拖动可移动';
+    ui.pillDot = h('span', 'dot');
+    ui.pillText = h('span', 'pill-text');
+    pill.append(ui.pillDot, ui.pillText);
+    pill.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter' && e.key !== ' ') return;
       e.preventDefault();
       setMode('full');
     });
-    draggable(ui.pill, () => setMode('full'));
+    draggable(pill, () => setMode('full'));
 
-    // 完整面板
-    ui.full = el('div', { width: '240px' });
-    const header = el('div', {
-      display: 'flex',
-      alignItems: 'center',
-      gap: '6px',
-      padding: '6px 8px',
-      cursor: 'move',
-      borderBottom: '1px solid var(--ctm-hair)',
-    });
-    ui.dot = dot();
-    const btn = (label, tip, onClick) => {
-      const b = el('button', {
-        background: 'transparent',
-        color: 'var(--ctm-ink2)',
-        border: '1px solid var(--ctm-control)',
-        borderRadius: '4px',
-        padding: '0 5px',
-        font: 'inherit',
-        cursor: 'pointer',
-      }, label);
+    // 完整面板：标题栏是模型和推理强度
+    const full = h('div', 'full');
+    const head = h('div', 'head');
+    ui.dot = h('span', 'dot');
+    const title = h('div', 'title');
+    ui.model = h('span', 'model', 'Token Meter');
+    ui.chips = h('span', 'chips');
+    title.append(ui.model, ui.chips);
+    const iconBtn = (label, tip, onClick) => {
+      const b = h('button', 'icon', label);
+      b.type = 'button';
       b.title = tip;
+      b.setAttribute('aria-label', tip);
       b.addEventListener('pointerdown', (e) => e.stopPropagation());
       b.addEventListener('click', onClick);
       return b;
     };
-    ui.debugBtn = btn('dbg', '在控制台打印抓到的事件', () => {
+    head.append(ui.dot, title, iconBtn('↺', '清零本会话的统计（订阅额度不清）', reset), iconBtn('–', '收起成一行', () => setMode('compact')));
+    draggable(head);
+
+    const body = h('div', 'body');
+    // 速度
+    const hero = h('div', 'hero');
+    ui.big = h('span', 'big', '–');
+    ui.unit = h('span', 'unit', 'tok/s');
+    ui.state = h('span', 'state');
+    hero.append(ui.big, ui.unit, ui.state);
+    ui.cap = h('div', 'cap');
+    ui.canvas = h('canvas', 'spark');
+    body.append(hero, ui.cap, ui.canvas, h('div', 'rule'));
+
+    // 上下文与订阅额度
+    const ctxBlock = h('div', 'block');
+    ui.context = addRow(ctxBlock, '上下文');
+    ui.ctxMeter = meter(ctxBlock);
+    ui.limitsBox = h('div');
+    body.append(ctxBlock, ui.limitsBox);
+    ui.extra = addRow(body, '额外用量', '超出订阅额度后按量付费的部分（本月）');
+    ui.extra.row.classList.add('block');
+    body.append(h('div', 'rule'));
+
+    // 本会话累计
+    ui.cost = addRow(body, 'API 等价费用');
+    ui.cost.value.classList.add('strong');
+    const grid = h('div', 'grid');
+    const cell = (label, tip, second) => {
+      const k = h('span', second ? 'k second' : 'k', label);
+      const v = h('span', 'v', '–');
+      k.title = v.title = tip;
+      grid.append(k, v);
+      return v;
+    };
+    ui.output = cell('输出', '含思考 token。≈ 表示本轮还没结束，未结束部分按正文估算（看不到思考，会偏低）');
+    ui.thinking = cell('思考', '输出里看不见的思考 token（CLI 记录的精确值，只统计已结束的轮次）', true);
+    ui.input = cell('输入', '未命中缓存的输入 token');
+    ui.requests = cell('请求', '本页面看到的 API 请求次数，含子代理', true);
+    ui.cacheRead = cell('缓存读', '从提示缓存读取的输入 token，单价约为输入的 1/10 到 1/20');
+    ui.cacheWrite = cell('缓存写', '写入提示缓存的输入 token，单价高于普通输入', true);
+    body.append(grid);
+    ui.models = h('div', 'models');
+    body.append(ui.models);
+
+    // 底栏：调试和设置
+    const foot = h('div', 'foot');
+    const link = (label, tip, onClick) => {
+      const b = h('button', 'link', label);
+      b.type = 'button';
+      b.title = tip;
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    ui.copyBtn = link('复制诊断', '复制解析状态（不含对话内容），报告“数字不准”时附上', copyDiagnostics);
+    ui.debugBtn = link('调试', '在控制台打印抓到的事件', () => {
       debug = !debug;
       lsSet('ctm-debug', debug ? '1' : '0');
       dirty = true;
     });
-    header.append(
-      ui.dot,
-      el('span', { flex: '1', fontWeight: '600' }, 'Token Meter'),
-      ui.debugBtn,
-      btn('↺', '清零（订阅额度不清）', reset),
-      btn('–', '收起成一行', () => setMode('compact'))
-    );
-    draggable(header);
+    ui.pollBtn = link('额度刷新', '', () => {
+      if (!pollOn || pollFails < 3) pollOn = !pollOn; // 失败停下时点一下是重试
+      pollFails = 0;
+      lsSet('ctm-poll', pollOn ? '1' : '0');
+      if (pollOn) pollUsage(true);
+      dirty = true;
+    });
+    foot.append(ui.copyBtn, ui.debugBtn, ui.pollBtn, h('span', 'ver', 'v' + VERSION));
 
-    const body = el('div', { padding: '6px 10px 8px' });
-    const sep = () => body.append(el('div', { borderTop: '1px solid var(--ctm-hair)', margin: '4px 0' }));
-    const row = (key, label, tip) => {
-      const r = addRow(body, label, tip);
-      ui[key] = r.value;
-      ui[key + 'Row'] = r.row;
-    };
-    row('speed', '实时速度', '最近 2 秒可见输出的速度（按字符估算，并用精确值自动校准）');
-    row('cur', '当前请求', '正在流式输出的这次 API 请求');
-    row('last', '上次请求', '上一次 API 请求的输出 token 数与平均速度；有精确数时包含看不见的思考');
-    row('turn', '上轮均速', '');
-    row('peak', '峰值速度', '');
-    sep();
-    row('context', '上下文', '主对话最近一次请求的输入 token（含缓存）/ 模型上下文窗口');
-    ui.ctxMeter = meter(body);
-    ui.limitsBox = el('div');
-    body.append(ui.limitsBox);
-    sep();
-    row('input', '输入', '未命中缓存的输入 token');
-    row('output', '输出', '含思考 token。≈ 表示本轮还没结束，未结束部分按正文估算（看不到思考，会偏低）');
-    row('cacheRead', '缓存读取', '');
-    row('cacheWrite', '缓存写入', '');
-    row('total', '合计', '输入 + 输出 + 缓存读写');
-    row('cost', 'API 等价费用', 'Claude Code 按 API 标价估算的累计费用；订阅用户不按此计费');
-    ui.canvas = el('canvas', { width: '100%', height: '36px', marginTop: '6px', display: 'block' });
-    body.append(ui.canvas);
-
-    ui.full.append(header, body);
-    root.append(ui.pill, ui.full);
-    document.body.append(root);
+    full.append(head, body, foot);
+    root.append(pill, full);
+    shadow.append(root);
+    document.body.append(host);
     applyTheme(pageIsDark() ? 'dark' : 'light');
     setMode(mode);
     W.addEventListener('resize', () => {
@@ -1280,16 +1990,13 @@
   function limitRow(l) {
     let r = ui.limitRows[l.name];
     if (!r) {
-      r = addRow(ui.limitsBox, l.label, '');
-      r.meter = meter(ui.limitsBox);
-      r.est = el('div', {
-        color: 'var(--ctm-ink2)',
-        fontSize: '11px',
-        textAlign: 'right',
-        margin: '-3px 0 4px',
-        fontVariantNumeric: 'tabular-nums',
-      });
-      ui.limitsBox.append(r.est);
+      const block = h('div', 'block');
+      r = addRow(block, l.label, '');
+      r.block = block;
+      r.meter = meter(block);
+      r.est = h('div', 'est');
+      block.append(r.est);
+      ui.limitsBox.append(block);
       ui.limitRows[l.name] = r;
     }
     return r;
@@ -1304,25 +2011,30 @@
     return (sum / span) * 1000;
   }
 
+  // 速度曲线：只在最近有过输出时显示
   function drawSpark() {
     const c = ui.canvas;
+    const data = state.spark;
+    const show = data.some((v) => v > 0);
+    c.style.display = show ? 'block' : 'none';
+    if (!show) return;
     const dpr = W.devicePixelRatio || 1;
     const w = c.clientWidth;
-    const h = c.clientHeight;
+    const hh = c.clientHeight;
     if (!w) return;
-    if (c.width !== w * dpr) {
-      c.width = w * dpr;
-      c.height = h * dpr;
+    if (c.width !== Math.round(w * dpr)) {
+      c.width = Math.round(w * dpr);
+      c.height = Math.round(hh * dpr);
     }
     const g = c.getContext('2d');
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, w, h);
-    const data = state.spark;
+    g.clearRect(0, 0, w, hh);
     const max = Math.max(10, ...data);
     g.strokeStyle = theme.hair;
+    g.lineWidth = 1;
     g.beginPath();
-    g.moveTo(0, h - 0.5);
-    g.lineTo(w, h - 0.5);
+    g.moveTo(0, hh - 0.5);
+    g.lineTo(w, hh - 0.5);
     g.stroke();
     if (data.length < 2) return;
     const step = w / (SPARK_POINTS - 1);
@@ -1330,25 +2042,27 @@
     g.beginPath();
     data.forEach((v, i) => {
       const x = x0 + i * step;
-      const y = h - 2 - (v / max) * (h - 6);
+      const y = hh - 2 - (v / max) * (hh - 12);
       i ? g.lineTo(x, y) : g.moveTo(x, y);
     });
     g.strokeStyle = theme.accent;
     g.lineWidth = 1.5;
     g.stroke();
-    g.lineTo(w, h);
-    g.lineTo(x0, h);
+    g.lineTo(w, hh);
+    g.lineTo(x0, hh);
     g.closePath();
-    g.fillStyle = tint(theme.accent, 0.15);
+    g.fillStyle = tint(theme.accent, 0.14);
     g.fill();
     g.fillStyle = theme.muted;
-    g.fillText(Math.round(max) + ' tok/s', 2, 9);
+    g.font = '10px system-ui, sans-serif';
+    g.fillText(Math.round(max) + ' tok/s', 0, 9);
   }
 
-  let live = { active: null, flowing: false, speed: 0 };
+  let live = { active: null, flowing: false, thinking: false, speed: 0 };
   let tick = 0;
   let paintedAt = 0;
   let pillKey = '';
+  let chipKey = '';
 
   function render() {
     const now = performance.now();
@@ -1358,22 +2072,24 @@
       if (!s.bulk && (!active || (s.last || s.t0) > (active.last || active.t0))) active = s;
     }
     const flowing = !!active && !!active.last && now - active.last < FLOW_MS;
-    live = { active, flowing, speed: flowing ? currentSpeed(now, active) : 0 };
+    live = { active, flowing, thinking: flowing && now - active.thinkAt < FLOW_MS, speed: flowing ? currentSpeed(now, active) : 0 };
     state.spark.push(live.speed);
     if (state.spark.length > SPARK_POINTS) state.spark.shift();
     if (live.speed > state.peak) state.peak = live.speed;
     if (!ui.root) return;
+    if (!ui.host.isConnected && document.body) document.body.append(ui.host); // 页面重建 body 内容时放回去
     if (tick++ % 4 === 0) applyTheme(pageIsDark() ? 'dark' : 'light');
     paint(false);
     // 收起时也定期算一次并存下来，下次换会话时能直接用
     if (state.readings.length && Date.now() - quotaAt > 30000) quotaRates();
+    if (tick % 20 === 0) pollUsage(false);
   }
 
   function paint(force) {
     const now = performance.now();
-    const { active, flowing, speed } = live;
+    const { active, flowing } = live;
     const dotColor = flowing ? STATUS.good : active ? theme.accent : theme.muted;
-    const dotTitle = flowing ? '正在输出' : active ? '请求进行中：等待输出或在思考（思考内容不可见）' : '空闲';
+    const dotTitle = flowing ? (live.thinking ? '正在思考' : '正在输出') : active ? '请求进行中：等待输出或在思考（思考内容不可见）' : '空闲';
     for (const d of [ui.dot, ui.pillDot]) {
       d.style.background = dotColor;
       d.style.opacity = active && !flowing && tick % 2 ? '0.35' : '1';
@@ -1384,71 +2100,156 @@
     if (!force && !dirty && !active && now - paintedAt < 15000) return;
     dirty = false;
     paintedAt = now;
-    const r = state.results[state.results.length - 1];
-    const v = { active, flowing, speed, turn: lastTurn(), c: contextNow(), lims: limitViews(), cost: r ? r.cost : 0 };
+    const v = { ...live, turn: lastTurn(), c: contextNow(), lims: limitViews(), t: sessionTotals(), mi: modelInfo() };
     if (mode === 'compact') paintCompact(v);
     else paintFull(v);
   }
 
   function paintCompact(v) {
-    const parts = []; // [文字, 程度]
-    if (v.flowing) parts.push([fmtSpeed(v.speed) + ' tok/s']);
+    const parts = []; // [文字, 程度, 附加文字]
+    if (v.mi.id) parts.push([modelName(v.mi.id), 'model', v.mi.effort + (v.mi.fast ? ' fast' : '')]);
+    if (v.flowing) parts.push([(v.thinking ? '思考 ' : '') + fmtSpeed(v.speed) + ' tok/s']);
     else if (v.active) parts.push(['思考中…']);
     else if (v.turn && v.turn.speed) parts.push([fmtSpeed(v.turn.speed) + ' tok/s']);
-    if (v.c) parts.push([fmt(v.c.used) + (v.c.max ? '/' + fmt(v.c.max) : '')]);
+    if (v.c) parts.push([fmt(v.c.used) + (v.c.max ? '/' + fmt(v.c.max) : ''), v.c.max ? levelOf(v.c.used / v.c.max, 0.7, 0.9) : '']);
     for (const l of v.lims) {
       // 5 小时额度总是显示；其他窗口用到一半以上才显示
-      if (l.name === 'five_hour' || l.used >= 0.5 || l.level !== 'normal') {
-        parts.push([l.short + ' ' + (l.expired ? '已重置' : fmtPct(l.used)), l.level]);
-      }
+      if (l.name === 'five_hour' || l.used >= 0.5 || l.level !== 'normal') parts.push([l.short + ' ' + limitShort(l), l.level]);
     }
-    if (v.cost) parts.push([fmtCost(v.cost, true)]);
+    if (v.t.cost) parts.push([(v.t.approxCost ? '≈' : '') + fmtCost(v.t.cost, true)]);
     if (!parts.length) parts.push(['Token Meter']);
     const key = JSON.stringify(parts);
     if (key === pillKey) return;
     pillKey = key;
     ui.pillText.textContent = '';
-    parts.forEach(([text, level], i) => {
-      if (i) ui.pillText.append(el('span', { color: 'var(--ctm-muted)' }, '·'));
-      const span = el('span', { display: 'inline-flex', alignItems: 'center', gap: '4px' });
-      // 额度偏高时在旁边加个状态色小方块；数字本身一直显示，颜色不单独表达含义
-      if (level && level !== 'normal') span.append(el('span', { width: '7px', height: '7px', borderRadius: '2px', background: STATUS[level] }));
-      span.append(text);
+    parts.forEach(([text, level, extra], i) => {
+      if (i) ui.pillText.append(h('span', 'muted', '·'));
+      const span = h('span');
+      if (level === 'model') {
+        span.append(h('b', null, text));
+        if (extra.trim()) span.append(' ', h('span', 'muted', extra.trim()));
+      } else {
+        // 偏高时在旁边加个状态色小方块；数字本身一直显示，颜色不单独表达含义
+        if (level && level !== 'normal') {
+          const sq = h('span', 'sq');
+          sq.style.background = STATUS[level];
+          span.append(sq);
+        }
+        span.append(text);
+      }
       ui.pillText.append(span);
     });
   }
 
-  function paintFull(v) {
-    const { active, flowing, speed, turn, c, lims, cost } = v;
-    ui.debugBtn.style.color = debug ? 'var(--ctm-accent)' : 'var(--ctm-ink2)';
-    ui.speed.textContent = flowing ? fmtSpeed(speed) + ' tok/s' : '–';
-    if (active && active.first) {
-      const dur = (active.last - active.first) / 1000;
-      const tokens = active.exact || active.est;
-      ui.cur.textContent = (active.exact ? '' : '≈') + fmt(tokens) + ' tok · ' + fmtSpeed(dur > 0.3 ? active.est / dur : null) + '/s';
-    } else ui.cur.textContent = active ? '等待输出…' : '–';
+  function modelTip(mi) {
+    const lines = [];
+    if (mi.id) lines.push('模型：' + mi.id + '（来自' + (INFO_SOURCES[mi.src] || mi.src) + '）');
+    if (mi.served && mi.set && modelName(mi.served) !== modelName(mi.set)) {
+      lines.push('设置的模型：' + mi.set + '；上一次请求由 ' + mi.served + ' 完成');
+    }
+    if (mi.effort) {
+      lines.push('推理强度：' + mi.effort + (EFFORT_NAMES[mi.effort] ? '（' + EFFORT_NAMES[mi.effort] + '）' : '') + '，来自' + (INFO_SOURCES[mi.effortSrc] || mi.effortSrc));
+    } else if (mi.effortNone) lines.push('推理强度：这个模型不使用推理强度参数');
+    else lines.push('推理强度：未知（这个会话的数据里还没出现，在网页上切换一次就能看到）');
+    if (mi.fast) lines.push('快速模式：开（按更高的单价计费）');
+    if (mi.ultracode) lines.push('ultracode：开');
+    return lines.join('\n');
+  }
+
+  function paintHeader(mi) {
+    ui.model.textContent = modelName(mi.id) || 'Token Meter';
+    ui.model.title = modelTip(mi);
+    const chips = [];
+    if (mi.effort) chips.push([mi.effort, '', '推理强度 ' + mi.effort + (EFFORT_NAMES[mi.effort] ? '（' + EFFORT_NAMES[mi.effort] + '）' : '')]);
+    if (mi.fast) chips.push(['fast', 'alt', '快速模式：输出更快，单价更高']);
+    if (mi.ultracode) chips.push(['ultracode', 'alt', 'ultracode：持续编排动态工作流']);
+    const key = JSON.stringify(chips) + ui.model.title;
+    if (key === chipKey) return;
+    chipKey = key;
+    ui.chips.textContent = '';
+    for (const [text, cls, tip] of chips) {
+      const c = h('span', 'chip' + (cls ? ' ' + cls : ''), text);
+      c.title = tip + '\n' + ui.model.title;
+      ui.chips.append(c);
+    }
+  }
+
+  function paintHero(v) {
+    const { active, flowing, thinking, speed, turn } = v;
     const lr = state.lastResp;
-    ui.last.textContent = lr ? (lr.exact ? '' : '≈') + fmt(lr.tokens) + ' tok · ' + fmtSpeed(lr.speed) + '/s' : '–';
-    ui.turn.textContent = turn ? (turn.speed ? fmtSpeed(turn.speed) + '/s · ' : '') + fmt(turn.tokens) + ' tok' : '–';
-    ui.turnRow.title = turn && turn.ms
-      ? `上一轮共输出 ${turn.tokens.toLocaleString()} tokens（含思考），API 耗时 ${(turn.ms / 1000).toFixed(1)} 秒。` +
-        '包含每次请求的首字延迟，所以会比实时速度低。'
-      : '上一轮的输出 token 数与平均速度';
-    ui.peak.textContent = state.peak ? fmtSpeed(state.peak) + ' tok/s' : '–';
+    let big = '–';
+    let unit = 'tok/s';
+    let st = '';
+    let cap = '';
+    let dim = false;
+    if (flowing) {
+      big = fmtSpeed(speed);
+      st = thinking ? '思考中' : '输出中';
+      const tokens = active.exact || active.est + active.think;
+      const dur = (active.last - active.first) / 1000;
+      cap = '本次请求 ' + (active.exact ? '' : '≈') + fmt(tokens) + ' tok · 平均 ' + fmtSpeed(dur > 0.3 ? (active.est + active.think) / dur : null) + '/s';
+    } else if (active) {
+      // 还没有输出：显示已经等了多久，像秒表
+      const s = Math.floor((performance.now() - active.t0) / 1000);
+      big = s < 60 ? String(s) : Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+      unit = s < 60 ? '秒' : '';
+      st = '等待输出';
+      cap = '请求进行中，多半在思考（思考内容不可见）';
+    } else if (turn && turn.speed) {
+      big = fmtSpeed(turn.speed);
+      dim = true;
+      st = '上轮均速';
+      cap = '上轮输出 ' + fmt(turn.tokens) + ' tok · API 耗时 ' + fmtDur(turn.ms);
+    } else if (lr && lr.speed) {
+      big = fmtSpeed(lr.speed);
+      dim = true;
+      st = '上次请求';
+      cap = '上次请求输出 ' + (lr.exact ? '' : '≈') + fmt(lr.tokens) + ' tok';
+    } else {
+      unit = '';
+      cap = turn ? '上轮输出 ' + fmt(turn.tokens) + ' tok' : '等待数据：发一条消息或打开一个会话';
+    }
+    ui.big.textContent = big;
+    ui.big.classList.toggle('dim', dim);
+    ui.unit.textContent = unit;
+    ui.state.textContent = st;
+    ui.cap.textContent = cap;
+    const tips = [];
+    if (turn) {
+      tips.push(
+        `上一轮共输出 ${turn.tokens.toLocaleString()} tokens（含思考和子代理）` +
+          (turn.ms ? `，API 耗时 ${(turn.ms / 1000).toFixed(1)} 秒。包含每次请求的首字延迟，所以会比实时速度低。` : '。')
+      );
+    }
+    if (lr) tips.push(`上次请求：${(lr.exact ? '' : '≈') + lr.tokens.toLocaleString()} tokens · ${fmtSpeed(lr.speed)} tok/s`);
+    if (state.peak) tips.push(`本页面看到的峰值速度：${fmtSpeed(state.peak)} tok/s`);
+    ui.cap.title = ui.big.title = tips.join('\n');
+  }
 
-    const frac = c && c.max ? c.used / c.max : 0;
-    ui.context.textContent = c ? fmt(c.used) + (c.max ? ' / ' + fmt(c.max) + ' · ' + fmtPct(frac) : '') : '–';
-    setMeter(ui.ctxMeter, frac, levelOf(frac, 0.7, 0.9));
-
+  function paintLimits(lims) {
     const rates = lims.length ? quotaRates() : {};
+    const shown = new Set();
     for (const l of lims) {
+      shown.add(l.name);
       const r = limitRow(l);
+      r.block.style.display = '';
       const q = rates[l.name];
-      if (q) {
+      const fresh = l.at ? '\n读数时间：' + fmtAgo(l.at) + (l.src === 'official' ? '（claude.ai 用量接口）' : '（请求返回的额度信息）') : '';
+      if (l.idle) {
+        r.value.textContent = '0% · 未开始';
+        r.row.title = '这个窗口里还没有用量，第一次请求时开始计时。' + fresh;
+      } else if (l.expired) {
+        r.value.textContent = '已重置 · 待更新';
+        r.row.title = '已过重置时间，新窗口的用量要等下一次请求或额度刷新后才知道。' + fresh;
+      } else {
+        r.value.textContent = fmtPct(l.used) + ' · ' + fmtReset(l.resetsAt) + ' 重置';
+        r.row.title = `还有 ${fmtLeft(l.resetsAt)}重置。数值是这里观察到的最大值。` + fresh;
+      }
+      if (q && !(l.used >= 1)) {
         const full = q.perPoint * 100; // 整个窗口折合的美元
         const left = Math.max(0, 1 - l.used) * full;
         const hours = rates.secPerDollar ? (left * rates.secPerDollar) / 3600 : null;
-        r.est.textContent = l.used >= 1 ? '已用完' : '约剩 ' + fmtUsd(left) + (hours == null ? '' : ' · ' + fmtHours(hours));
+        r.est.textContent = '约剩 ' + fmtUsd(left) + (hours == null ? '' : ' · ' + fmtHours(hours));
         r.est.title =
           `按 API 标价折算，整个 ${l.label}约 ${fmtUsd(full)}（每 1% ≈ ${fmtUsd(q.perPoint, true)}` +
           (q.ratio
@@ -1456,26 +2257,65 @@
             : `，依据 ${q.points} 个百分点、${fmtUsd(q.dollars)} 的花费）`) +
           (rates.secPerDollar ? `；按你最近的用法，模型每运行 1 小时约花 ${fmtUsd(3600 / rates.secPerDollar)}` : '') +
           '。只是估算：假设统计期间账号没有别处的使用；换模型或用法差别很大时会不准。';
-      } else {
+      } else if (l.used >= 1) {
+        r.est.textContent = '已用完';
+        r.est.title = '';
+      } else if (LIMIT_NAMES[l.name]) {
         r.est.textContent = '剩余：估算中';
         r.est.title = '这个页面看到这项额度涨过至少两次后，才能估算它折合多少钱';
+      } else {
+        r.est.textContent = '';
+        r.est.title = '';
       }
-      r.value.textContent = l.expired ? '已重置' : fmtPct(l.used) + ' · ' + fmtReset(l.resetsAt) + ' 重置';
-      r.row.title = l.expired
-        ? '已过重置时间，下一次请求后显示新窗口的用量'
-        : `还有 ${fmtLeft(l.resetsAt)}重置。数值是这里观察到的最大值，` +
-          '在其他设备或 App 上的用量要等这里下一次请求后才会更新。';
+      r.est.style.display = r.est.textContent ? '' : 'none';
       setMeter(r.meter, l.used, l.level);
     }
+    for (const name in ui.limitRows) if (!shown.has(name)) ui.limitRows[name].block.style.display = 'none';
+    const ex = extraUsage;
+    const showExtra = !!ex && ex.enabled && ex.limit > 0;
+    ui.extra.row.style.display = showExtra ? '' : 'none';
+    if (showExtra) {
+      const unit = ex.currency === 'USD' ? '$' : ex.currency + ' ';
+      ui.extra.value.textContent = unit + (ex.used / 100).toFixed(2) + ' / ' + unit + Math.round(ex.limit / 100);
+    }
+  }
 
-    const t = sessionTotals();
-    ui.input.textContent = fmt(t.input);
+  function paintFull(v) {
+    const { c, lims, t, mi } = v;
+    paintHeader(mi);
+    paintHero(v);
+
+    const frac = c && c.max ? c.used / c.max : 0;
+    ui.context.value.textContent = c ? fmt(c.used) + (c.max ? ' / ' + fmt(c.max) + ' · ' + fmtPct(frac) : '') : '–';
+    ui.context.row.title =
+      '主对话最近一次请求的输入 token（含缓存）/ 模型上下文窗口' + (c && c.compactAt ? `\n竖线是自动压缩阈值（约 ${fmt(c.compactAt)}）` : '');
+    setMeter(ui.ctxMeter, frac, levelOf(frac, 0.7, 0.9), c && c.compactAt && c.max ? c.compactAt / c.max : 0);
+    paintLimits(lims);
+
+    ui.cost.value.textContent = t.cost ? (t.approxCost ? '≈' : '') + fmtCost(t.cost) : '–';
+    ui.cost.row.title =
+      'Claude Code 按 API 标价估算的累计费用，订阅用户不按此计费。' +
+      (t.runs > 1 ? `\n这个会话里累计值重新开始过 ${t.runs - 1} 次（/clear 或续接），已分段相加。` : '') +
+      (t.approxCost ? '\n≈：本轮还没结束，未结束部分按最近的平均单价估算。' : '');
     ui.output.textContent = (t.approx ? '≈' : '') + fmt(t.output);
+    ui.thinking.textContent = t.thinking ? fmt(t.thinking) : '–';
+    ui.input.textContent = fmt(t.input);
+    ui.requests.textContent = t.requests ? fmt(t.requests) : '–';
     ui.cacheRead.textContent = fmt(t.cacheRead);
     ui.cacheWrite.textContent = fmt(t.cacheWrite);
-    ui.total.textContent = (t.approx ? '≈' : '') + fmt(t.input + t.output + t.cacheRead + t.cacheWrite);
-    ui.costRow.style.display = cost ? 'flex' : 'none';
-    ui.cost.textContent = cost ? fmtCost(cost) : '';
+    const models = Object.entries(t.models).sort((a, b) => b[1].cost - a[1].cost);
+    ui.models.textContent = models.length > 1 ? models.map(([name, x]) => name + ' ' + fmtCost(x.cost, true)).join(' · ') : '';
+    ui.models.title = models.length > 1 ? '各模型的累计费用（子代理、压缩等也会用到其他模型）' : '';
+    ui.models.style.display = ui.models.textContent ? '' : 'none';
+
+    ui.debugBtn.classList.toggle('on', debug);
+    ui.debugBtn.textContent = debug ? '调试：开' : '调试';
+    ui.pollBtn.classList.toggle('on', pollOn && pollFails < 3);
+    ui.pollBtn.textContent = '额度刷新：' + (!pollOn ? '关' : pollFails >= 3 ? '失败' : '开');
+    ui.pollBtn.title =
+      '每 3 分钟从 claude.ai 的用量接口（设置 → 用量页面用的同一个只读接口）刷新一次订阅额度，点击开关。' +
+      (officialAt ? '\n上次成功：' + fmtAgo(officialAt) : '') +
+      (pollErr ? '\n上次失败：' + pollErr : '');
   }
 
   function boot() {
@@ -1487,6 +2327,7 @@
   setInterval(safe(render), 500);
 
   W.__ctm = {
+    version: VERSION,
     get state() {
       return state;
     },
@@ -1494,8 +2335,13 @@
       return limits;
     },
     totals: sessionTotals,
+    runs,
     context: contextNow,
+    model: modelInfo,
+    lastTurn,
     quota: () => ({ session: sessionQuotaRates(), combined: quotaRates() }),
+    diagnostics,
+    pollUsage: () => pollUsage(true),
     mode: (m) => setMode(m === 'full' ? 'full' : 'compact'),
     reset,
     debug(on = true) {
