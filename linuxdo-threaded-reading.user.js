@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Linux DO 楼中楼阅读
 // @namespace    local.linuxdo.threaded-reading
-// @version      4.6.0
+// @version      4.7.0
 // @description  楼中楼递进连线、引用切换、阅读进度和新回复定位，保留原生操作。
 // @match        https://linux.do/*
 // @run-at       document-idle
@@ -187,6 +187,11 @@
     .ldt-progress-mobile { display: block; color: var(--primary, #333); font-size: 12px; font-weight: 600; line-height: 1.5; white-space: nowrap; }
     .ldt-progress-rail:focus-visible { outline: 2px solid var(--tertiary, #3979a3); outline-offset: 3px; border-radius: 4px; }
     .ldt-auto-quote blockquote { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .ldt-unread {
+      display: inline-block; margin-inline-start: 6px; padding: 0 6px; border: 1px solid var(--tertiary, #3979a3); border-radius: 9px;
+      color: var(--tertiary, #3979a3); font-size: 11px; font-weight: 600; line-height: 16px; vertical-align: middle; white-space: nowrap; text-decoration: none;
+    }
+    .ldt-unread:hover { background: var(--tertiary-very-low, #eef4f8); }
     @media (max-width: 640px) {
       .ldt-updates { right: auto; left: 50%; transform: translateX(-50%); bottom: calc(62px + env(safe-area-inset-bottom, 0px)); white-space: nowrap; }
       #ld-drawer-root [data-ldt-sidepeek] .ld-post-card > .ld-inline-thread { margin-inline: 24px 10px; padding-inline: 10px; }
@@ -220,28 +225,39 @@
   let connected = new WeakSet();
   const stuckNodes = new Set();
   const connectorLinks = new WeakMap();
+  let keyboardPatched = false;
   let avatarCache = new WeakMap();
   const avatarKinds = new Map();
   let viewportWidth = window.innerWidth;
   // 新回复记录最多保留的帖子数和天数。
   const UPDATE_KEEP = 300, UPDATE_DAYS = 30;
   // 脚本自己插入的节点：新增的不必理会；正文里的标注若被别人删掉（例如论坛重绘），要重新补上。
-  const UI = '.ldt-connectors, .ldt-updates, .ldt-reading-progress, .ldt-progress-navigation, .ldt-progress-mobile';
+  const UI = '.ldt-connectors, .ldt-updates, .ldt-reading-progress, .ldt-progress-navigation, .ldt-progress-mobile, .ldt-unread';
   const OWN = `${UI}, .ldt-modebar, .ldt-relation, .ldt-sidepeek-relation, .ldt-owner-label, .ldt-auto-quote`;
   const is = (node, selector) => node.nodeType === 1 && node.matches(selector);
   const foreign = r => !r.target.closest?.(OWN) && (r.type !== 'childList' || [...r.addedNodes].some(n => !is(n, OWN)) || [...r.removedNodes].some(n => !is(n, UI)));
   // 论坛滚动时会折叠、恢复远处楼层并重新渲染内容。回调在同一帧绘制前执行，直接补回整理结果，不留原样闪一下的空档。
   const observer = new MutationObserver(records => {
     let layout = false, progress = false, any = false;
+    const rows = new Set();
     for (const r of records) {
       if (!foreign(r)) continue;
       any = true;
       const t = r.target;
+      const row = t.closest?.('tr.topic-list-item');
+      if (row) rows.add(row);
+      for (const n of r.addedNodes) {
+        if (n.nodeType !== 1) continue;
+        if (n.matches('tr.topic-list-item')) rows.add(n);
+        else n.querySelectorAll('tr.topic-list-item').forEach(item => rows.add(item));
+      }
+      if (layout) continue;
       if (state && (state.stream.contains(t) || t === state.stream.parentElement) || t.closest?.('#ld-drawer-root')
-        || (t === document.body && [...r.addedNodes].some(n => n.id === 'ld-drawer-root'))) { layout = true; break; }
-      if (t.closest?.('.timeline-container, #topic-progress-wrapper, #topic-progress')) progress = true;
+        || (t === document.body && [...r.addedNodes].some(n => n.id === 'ld-drawer-root'))) layout = true;
+      else if (t.closest?.('.timeline-container, #topic-progress-wrapper, #topic-progress')) progress = true;
     }
     if (!any) return;
+    if (rows.size) updateTopicList(rows);
     const id = enabled ? topicId() : 0;
     const stream = id ? document.querySelector('.post-stream') : null;
     if (layout || stream !== (state?.stream || null) || (state && state.id !== id)) refresh();
@@ -306,19 +322,27 @@
       if (delay) await new Promise(resolve => setTimeout(resolve, delay));
       if (s !== state || s.abort.signal.aborted) return;
       s.nextRequest = Date.now() + 1000;
+      let failed = false;
       try {
         const response = await fetch(parent ? `/t/${s.id}/${parent}.json` : `/t/${s.id}.json`, {
           credentials: 'same-origin', signal: s.abort.signal,
           headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         });
-        if (!response.ok) return;
-        const data = await response.json();
-        if (s !== state) return;
-        s.total = Number(data.posts_count) || s.total;
-        s.highest = Number(data.highest_post_number) || s.highest || 0;
-        merge(s, data.post_stream?.posts);
-        schedule();
-      } catch { /* 权限或网络失败时仍保留原生评论。 */ }
+        if (response.ok) {
+          const data = await response.json();
+          if (s !== state) return;
+          s.total = Number(data.posts_count) || s.total;
+          s.highest = Number(data.highest_post_number) || s.highest || 0;
+          merge(s, data.post_stream?.posts);
+          schedule();
+        } else failed = response.status === 429 || response.status >= 500;
+      } catch { failed = true; }
+      // 网络或服务器出错时过一会儿允许再请求，最多重试三次；没权限、楼层不存在就不再请求，仍保留原生评论。
+      if (failed && s === state && !s.abort.signal.aborted) {
+        const tries = (s.tries.get(parent) || 0) + 1;
+        s.tries.set(parent, tries);
+        if (tries <= 3) setTimeout(() => { if (s === state) { s.requested.delete(parent); schedule(); } }, 5000 * 2 ** (tries - 1));
+      }
     });
   }
 
@@ -387,6 +411,29 @@
     return node && !node.classList.contains('post-stream--cloaked') && node.querySelector(':scope > article') ? node : null;
   }
 
+  // 论坛的 j/k 按楼号选上下一楼，楼中楼模式下画面上会乱跳。让它取楼层时按画面顺序排，
+  // 楼内翻页、选中和 r/l 等快捷键仍由论坛处理；拿不到论坛的快捷键服务时保持原样。
+  function patchKeyboard() {
+    if (keyboardPatched) return;
+    try {
+      const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+      const shortcuts = page.Discourse?.lookup('service:keyboard-shortcuts');
+      const original = shortcuts?._findArticles;
+      if (typeof original !== 'function') return;
+      keyboardPatched = true;
+      const visual = function () {
+        const found = original.call(this);
+        if (!found || !state || mode !== 'thread' || !state.stream.isConnected) return found;
+        const items = [...found].map(node => ({ node, rect: node.getBoundingClientRect() }))
+          .filter(({ rect }) => rect.height).sort((a, b) => a.rect.top - b.rect.top);
+        const list = new page.Array();
+        for (const { node } of items) list.push(node);
+        return list;
+      };
+      shortcuts._findArticles = typeof exportFunction === 'function' ? exportFunction(visual, page) : visual;
+    } catch { /* 保持论坛原有行为。 */ }
+  }
+
   // 和点帖子里的楼层链接一样交给论坛站内跳转，只加载那一段，不整页刷新；论坛没接管时浏览器照常打开链接。
   function routeTo(href) {
     const link = element('a', 'ldt-route');
@@ -420,6 +467,44 @@
     if (highest > s.lastKnown) s.updates.add(highest);
     for (const number of s.posts.keys()) if (number > s.since && !s.seenNew.has(number)) s.updates.add(number);
     s.lastKnown = Math.max(s.lastKnown, highest);
+  }
+
+  // 按脚本记下的实际看过的楼层算还没看的回复：since 之前都看过，pending 是看到过但还没看的楼层，
+  // 上次之后新增的按楼号估算。和帖子里"N 条新回复"的算法一致。
+  function unseenPosts(record, highest) {
+    const since = Number(record?.since) || 0;
+    if (!since) return { count: 0 };
+    const seen = new Set(Array.isArray(record.seen) ? record.seen : []);
+    const pending = (Array.isArray(record.pending) ? record.pending : []).filter(n => Number.isSafeInteger(n) && n > since && !seen.has(n));
+    const known = Math.max(Number(record.highest) || 0, since, ...pending);
+    const count = new Set(pending).size + Math.max(0, highest - known);
+    const first = Math.min(...pending, highest > known ? known + 1 : Infinity);
+    return { count, first: Number.isFinite(first) ? first : 0 };
+  }
+
+  // 帖子列表：楼中楼模式下论坛只记看过的最大楼号，未读数会偏少。脚本算出的比论坛显示的多时，补一个"未看 N"。
+  function updateTopicList(rows = document.querySelectorAll('tr.topic-list-item[data-topic-id]')) {
+    for (const row of rows) {
+      if (!row.isConnected) continue;
+      const id = Number(row.dataset.topicId);
+      const href = row.querySelector('a.post-activity, .activity a[href]')?.getAttribute('href') || '';
+      const highest = Number(href.split(/[?#]/)[0].split('/').filter(Boolean).at(-1)) || 0;
+      const record = enabled && id && highest && typeof GM_getValue === 'function' ? GM_getValue(`topic-updates:${id}`, null) : null;
+      const { count, first } = unseenPosts(record, highest);
+      const native = Number(row.querySelector('.badge-notification.unread-posts')?.textContent) || 0;
+      let badge = row.querySelector('.ldt-unread');
+      if (count <= native) { badge?.remove(); continue; }
+      const place = row.querySelector('.topic-post-badges') || row.querySelector('.raw-topic-link');
+      if (!place) continue;
+      if (!badge) badge = element('a', 'ldt-unread');
+      if (place.classList.contains('topic-post-badges')) { if (badge.parentElement !== place) place.append(badge); }
+      else if (place.nextElementSibling !== badge) place.after(badge);
+      const text = `未看 ${count}`, link = `/t/topic/${id}/${first}`;
+      if (badge.textContent !== text) badge.textContent = text;
+      if (badge.getAttribute('href') !== link) badge.setAttribute('href', link);
+      const title = `楼中楼阅读：按实际看过的楼层算，还有 ${count} 条回复没看`;
+      if (badge.title !== title) badge.title = title;
+    }
   }
 
   // 新回复记录只留最近看过的，免得越积越多：油猴每次打开页面都会把存储整体载入。每天清理一次。
@@ -818,6 +903,11 @@
     try { arrange(); } finally { observe(); }
   }
 
+  function refreshAll() {
+    refresh();
+    updateTopicList();
+  }
+
   function arrange() {
     updateSidepeek();
     const id = topicId();
@@ -826,12 +916,13 @@
     const created = state?.id !== id || state?.stream !== stream;
     if (created) {
       cleanup();
-      state = { id, stream, posts: new Map(), quotes: new Map(), requested: new Set(), abort: new AbortController(), queue: Promise.resolve(), nextRequest: 0 };
+      state = { id, stream, posts: new Map(), quotes: new Map(), requested: new Set(), tries: new Map(), abort: new AbortController(), queue: Promise.resolve(), nextRequest: 0 };
       state.bar = modebar(state);
       state.style = element('style', 'ldt-layout');
       document.head.append(state.style);
     }
     const s = state;
+    patchKeyboard();
     watchConnectors(stream);
     // 此刻论坛可能已改动但还没绘制，按上一帧画面里的位置找回阅读点；页面被程序滚动过时退回当前测量。
     let anchor = s.settled?.node, anchorTop = s.settled?.top;
@@ -932,7 +1023,7 @@
   }
 
   function schedule() { clearTimeout(timer); timer = setTimeout(refresh, 80); }
-  if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('开启 / 关闭评论整理', () => { enabled = !enabled; refresh(); });
+  if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('开启 / 关闭评论整理', () => { enabled = !enabled; refreshAll(); });
   window.addEventListener('popstate', schedule);
   // 滚动事件早于论坛在这一帧里的重绘，先把记下的阅读位置跟着平移。
   window.addEventListener('scroll', () => {
@@ -944,7 +1035,8 @@
     if (window.innerWidth !== viewportWidth) { viewportWidth = window.innerWidth; avatarCache = new WeakMap(); avatarKinds.clear(); }
     scheduleLayout();
   });
-  document.addEventListener('visibilitychange', scheduleProgress);
+  // 回到这个标签页时，别的标签页可能刚看过帖子，列表上的未看数跟着更新。
+  document.addEventListener('visibilitychange', () => { scheduleProgress(); if (!document.hidden) updateTopicList(); });
   document.addEventListener('load', scheduleLayout, true);
   document.addEventListener('scroll', scheduleProgress, { passive: true, capture: true });
   document.addEventListener('click', event => {
@@ -960,5 +1052,5 @@
   }, true);
   setInterval(() => { if (enabled && topicId() !== (state?.id || 0)) schedule(); }, 1000);
   setTimeout(pruneUpdates, 5000);
-  refresh();
+  refreshAll();
 })();
