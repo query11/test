@@ -1,0 +1,11 @@
+{
+  "name": "linuxdo-threaded-reading-tests",
+  "private": true,
+  "description": "Mock Discourse pages and browser tests for linuxdo-threaded-reading.user.js",
+  "scripts": {
+    "test": "node run-all.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.56.1"
+  }
+}

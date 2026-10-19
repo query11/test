@@ -1,0 +1,27 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { margin: 0; padding-top: 60px; font: 15px/1.5 sans-serif; }
+  .d-header { position: fixed; top: 0; left: 0; right: 0; height: 60px; background: #eee; }
+  .topic-list { width: 100%; max-width: 900px; margin: 0 auto; border-collapse: collapse; }
+  .topic-list td { padding: 8px; border-bottom: 1px solid #ddd; }
+  .badge-notification { display: inline-block; padding: 0 6px; border-radius: 9px; background: #3979a3; color: #fff; font-size: 11px; }
+</style></head>
+<body>
+<div class="d-header"></div>
+<!-- Rows follow Discourse's topic-list/item.gjs: tr[data-topic-id], .raw-topic-link, .topic-post-badges,
+     and the activity cell's a.post-activity pointing at /t/<slug>/<id>/<highest_post_number>. -->
+<div id="main"><table class="topic-list"><tbody></tbody></table></div>
+<script>
+  window.addRow = ({ id, highest, unread = 0 }) => {
+    const row = document.createElement('tr');
+    row.className = 'topic-list-item';
+    row.dataset.topicId = id;
+    row.innerHTML = `<td class="main-link topic-list-data"><span class="link-top-line"><a class="title raw-link raw-topic-link" href="/t/topic/${id}">话题 ${id}</a>`
+      + `<span class="topic-post-badges">${unread ? `&nbsp;<a class="badge badge-notification unread-posts" href="/t/topic/${id}/${highest - unread + 1}">${unread}</a>` : ''}</span></span></td>`
+      + `<td class="num activity"><a class="post-activity" href="/t/topic/${id}/${highest}">1天</a></td>`;
+    document.querySelector('.topic-list tbody').append(row);
+    return row;
+  };
+</script>
+</body></html>

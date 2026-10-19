@@ -1,0 +1,32 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --header-offset: 60px; --space-1: 4px; --primary-very-low: #f3f4f6; --primary-low: #d0d3d8; --primary-medium: #777; --tertiary: #3979a3; --secondary: #fff; --primary: #222; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding-top: 60px; font: 15px/1.5 sans-serif; background: #fff; }
+  .d-header { position: fixed; top: 0; left: 0; right: 0; height: 60px; background: #eee; z-index: 1000; }
+  #main { max-width: 760px; margin: 0 auto; }
+  .posts-wrapper { padding: 0 10px; }
+  .topic-post { }
+  .topic-post article { border-top: 1px solid #e5e5e5; }
+  .row { display: flex; }
+  .topic-avatar { flex: 0 0 auto; width: 58px; padding-top: 15px; }
+  .topic-avatar img.avatar { display: block; width: 48px; height: 48px; border-radius: 50%; background: #bbb; }
+  .topic-post.sticky-avatar > article > .row > .topic-avatar { position: sticky; top: calc(var(--header-offset) - var(--space-1)); margin-bottom: 25px; align-self: flex-start; }
+  .topic-body { flex: 1 1 auto; min-width: 0; padding: 12px 11px 0; }
+  .topic-meta-data { display: flex; justify-content: space-between; }
+  .names { display: flex; gap: 6px; }
+  .cooked p { margin: 0 0 1em; }
+  .post-menu-area { display: flex; justify-content: flex-end; margin: 8px 0; }
+  .btn { min-height: 30px; }
+  .topic-map__stats { display: flex; align-items: center; gap: 10px; border: 1px solid #ddd; padding: 6px; }
+  .timeline-container { position: fixed; top: 120px; right: 20px; width: 150px; }
+  .timeline-scrollarea { height: 300px; border-left: 2px solid #ccc; }
+  @media (max-width: 640px) { .timeline-container { display: none; } .topic-avatar { width: 50px; } .topic-avatar img.avatar { width: 40px; height: 40px; } }
+</style></head>
+<body>
+<div class="d-header"></div>
+<div id="main"><div class="posts-wrapper"><div class="post-stream"></div></div></div>
+<div class="timeline-container"><div class="timeline-scrollarea" style="height: 300px"></div></div>
+<script src="/mock/mock.js"></script>
+</body></html>
