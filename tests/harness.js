@@ -7,7 +7,8 @@ const path = require('path');
 const SRC = fs.readFileSync(process.env.CTM_SCRIPT || path.join(__dirname, '..', 'claude-token-meter.user.js'), 'utf8');
 
 // opts.now：起始时间（毫秒）；opts.storage：预置的 localStorage，对象会拷贝一份，传 Map 则直接共用
-// （模拟同一个浏览器里的两个标签页）；opts.path：页面路径（会话）；opts.locks：navigator.locks 的替身，默认没有
+// （模拟同一个浏览器里的两个标签页）；opts.path：页面路径（会话）；opts.locks：navigator.locks 的替身，默认没有；
+// opts.fetch：页面的 fetch（脚本加载时挂钩它，查用量接口也用它）；opts.cookie：document.cookie（当前组织在里面）
 function load(opts = {}) {
   const clock = { now: opts.now || Date.parse('2026-10-20T02:00:00Z'), perf: 1000 };
   const store = opts.storage instanceof Map ? opts.storage : new Map(Object.entries(opts.storage || {}));
@@ -16,14 +17,14 @@ function load(opts = {}) {
     setItem: (k, v) => void store.set(k, String(v)),
     removeItem: (k) => void store.delete(k),
   };
-  const window = { addEventListener() {}, matchMedia: () => ({ matches: false }) };
+  const window = { addEventListener() {}, matchMedia: () => ({ matches: false }), fetch: opts.fetch };
   const document = {
     readyState: 'loading', // DOMContentLoaded 不会来，所以不建 UI
     addEventListener() {},
     body: null,
     documentElement: {},
     visibilityState: 'visible',
-    cookie: '',
+    cookie: opts.cookie || '',
   };
   const location = { pathname: opts.path || '/code/session_0123456789abcdefghij' };
   const history = { pushState() {}, replaceState() {} };

@@ -66,3 +66,27 @@ test('闲置超过 5 分钟（期间可能在别处用），前后的读数不�
   const [perPoint] = h.ctm.quota().session.five_hour;
   assert.ok(Math.abs(perPoint - 1) < 1e-6, 'perPoint ' + perPoint);
 });
+
+test('重开会话时历史只加载了一部分：不用依据更少的估算覆盖存下的', () => {
+  const store = new Map();
+  const h = load({ now: T0, storage: store });
+  turns(h, 21);
+  h.ctm.quota();
+  const key = '/code/session_0123456789abcdefghij';
+  const saved = JSON.parse(store.get('ctm-rates-v4'))[key].r;
+  assert.ok(saved.five_hour[1] >= 8, 'points ' + saved.five_hour[1]);
+
+  // 重开：历史只加载了最后 7 轮
+  const h2 = load({ now: T0 + 3600e3, storage: store });
+  const events = [];
+  for (let k = 14; k < 21; k++) {
+    const t = T0 + (k + 1) * 20000;
+    events.push(assistant('msg_' + k, { input: 10, cacheRead: 50000 + k * 1000, cacheWrite: 1000, text: 'x'.repeat(400), timestamp: t - 1000 }));
+    events.push(rateLimit({ five_hour: [(10 + Math.floor(k / 2)) / 100, RESET] }));
+    events.push(result({ [OPUS]: { input: 10 * (k + 1), output: 100 * (k + 1), cacheRead: 50000 * (k + 1), cost: 0.5 * (k + 1) } }, { timestamp: t }));
+  }
+  h2.feed(events);
+  const partial = h2.ctm.quota().session;
+  assert.ok(partial.five_hour && partial.five_hour[1] < saved.five_hour[1], 'partial ' + JSON.stringify(partial));
+  assert.deepEqual(JSON.parse(store.get('ctm-rates-v4'))[key].r, saved);
+});

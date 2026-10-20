@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.6.0
+// @version      1.6.1
 // @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示模型、推理强度、token 用量、生成速度、提示缓存与订阅额度
 // @homepageURL  https://github.com/query11/test
 // @downloadURL  https://raw.githubusercontent.com/query11/test/HEAD/claude-token-meter.user.js
@@ -37,7 +37,7 @@
   const W = window;
   if (W.__ctm) return;
 
-  const VERSION = '1.6.0';
+  const VERSION = '1.6.1';
   const FLOW_MS = 1500; // 这么久内收到过 token 视为“正在输出”
   // 流式请求这么久没动静就不再显示为进行中（防止漏掉 message_stop 时一直亮着）。只影响显示：
   // 这一路的统计留着，之后再来增量照常计入，真正结束看 message_stop / 下一个 message_start / result
@@ -1199,7 +1199,8 @@
 
   // { ttl, ttlKnown, warmAt, expiresAt, tokens: 下一次请求的上下文, nextExtra: 缓存过期后下一次请求多花的钱,
   //   listed, rebuilds: [{ t, tokens, cause, expected, extra }] }
-  function cacheState() {
+  // c、mi 是 contextNow()、modelInfo() 的结果，重绘时已经算过就传进来
+  function cacheState(c = contextNow(), mi = modelInfo()) {
     const main = [];
     for (const m of state.messages.values()) if (m.lane === 'main' && orderKey(m) != null && messageContext(m) > 0) main.push(m);
     if (!main.length) return null;
@@ -1234,9 +1235,7 @@
 
     const last = main[main.length - 1];
     const cut = latestOf(state.resets, (x) => x.seq);
-    const c = contextNow();
     const tokens = c && !(cut && isAfter(cut, last)) ? c.used : 0; // /clear 之后旧缓存用不上了
-    const mi = modelInfo();
     const pr = cachePrices(last.model || mi.id, tokens, ttl, mi.fast);
     return {
       ttl,
@@ -1441,6 +1440,9 @@
     } catch {}
   });
 
+  // 一个会话的估算依据了多少个百分点（各窗口相加）
+  const ratePoints = (r) => Object.keys(r || {}).reduce((s, k) => s + (k === 'sec' || k === 'ratio' ? 0 : num(r[k] && r[k][1])), 0);
+
   // { 窗口名: { perPoint: 每 1% 美元数, points: 依据的百分点数, dollars: 依据的花费 }, secPerDollar: 每美元对应的模型运行秒数 }
   function quotaRates() {
     const now = Date.now();
@@ -1448,7 +1450,9 @@
     quotaAt = now;
     const mine = sessionQuotaRates();
     const key = location.pathname;
-    if (Object.keys(mine).length && JSON.stringify(mine) !== JSON.stringify(rateStore[key] && rateStore[key].r)) {
+    const old = rateStore[key] && rateStore[key].r;
+    // 重开会话时历史可能只加载了一部分，算出来的依据更少，这时留着存下的那份
+    if (Object.keys(mine).length && JSON.stringify(mine) !== JSON.stringify(old) && ratePoints(mine) >= ratePoints(old)) {
       rateStore[key] = { t: now, r: mine };
       // 只留最近 30 个会话、45 天以内的
       const keep = Object.keys(rateStore)
@@ -1890,7 +1894,26 @@
       dirty = true;
     }
   }
-  document.addEventListener('visibilitychange', () => pollUsage(false));
+  document.addEventListener('visibilitychange', () => {
+    dirty = true;
+    pollUsage(false);
+  });
+
+  // 窗口过了重置时间、最近的读数又在重置之前时，显示“已重置 · 待更新”，要等下一次轮询（最多 3 分钟）。
+  // 重置后几秒就查一次。每个窗口的每次重置只查一次：返回的数据里没有这个窗口时，不会每分钟查个不停
+  const RESET_GRACE_MS = 5000;
+  const resetPolled = new Set();
+  function pollAfterReset() {
+    const now = Date.now();
+    const due = limitViews()
+      .filter((l) => l.expired && num(l.at) < l.resetsAt * 1000 && now >= l.resetsAt * 1000 + RESET_GRACE_MS)
+      .map((l) => l.name + ':' + l.resetsAt)
+      .filter((k) => !resetPolled.has(k));
+    if (!due.length) return;
+    const before = pollAt;
+    pollUsage(true); // 关掉了、失败停下了、一分钟内刚查过、页面不可见时不会发请求，下次刷新再试
+    if (pollAt !== before) for (const k of due) resetPolled.add(k);
+  }
 
   // ---------------------------------------------------------------- 诊断
 
@@ -1950,7 +1973,8 @@
   };
   const fmtSpeed = (s) => (s == null ? '–' : s.toFixed(1));
   const fmtPct = (f) => Math.round(f * 100) + '%';
-  const fmtCost = (c, short) => '$' + c.toFixed(c >= 1 || (short && c >= 0.1) ? 2 : short || c >= 0.1 ? 3 : 4);
+  const fmtCost = (c, short) =>
+    c >= 1000 ? '$' + Math.round(c).toLocaleString() : '$' + c.toFixed(c >= 1 || (short && c >= 0.1) ? 2 : short || c >= 0.1 ? 3 : 4);
   const fmtUsd = (v, precise) => '$' + (precise ? v.toFixed(2) : v >= 10 ? Math.round(v).toLocaleString() : v.toFixed(1));
   const fmtHours = (h) => (h < 1 ? Math.max(1, Math.round(h * 60)) + ' 分钟' : (h < 10 ? h.toFixed(1) : Math.round(h)) + ' 小时');
 
@@ -2128,7 +2152,7 @@
     .link:hover { background: var(--control); color: var(--ink); }
     .link.on { color: var(--accent); }
     .ver { margin-left: auto; padding-right: 6px; min-width: 0; overflow: hidden; white-space: nowrap; }
-    .foot .link { flex: none; white-space: nowrap; }
+    .foot .link { flex: none; white-space: nowrap; padding: 2px 4px; }
     .tabs { display: flex; gap: 2px; padding: 2px; margin-bottom: 8px; border-radius: 7px; background: var(--control); }
     .tab { flex: 1; border: 0; background: transparent; color: var(--ink2); font: inherit; line-height: 18px; padding: 1px 0;
       border-radius: 5px; cursor: pointer; }
@@ -2730,10 +2754,15 @@
     if (state.spark.length > SPARK_POINTS) state.spark.shift();
     if (live.speed > state.peak) state.peak = live.speed;
     if (state.results.length && (!ledgerSeen || ledgerSeen.state !== state || ledgerSeen.rev !== state.rev)) updateLedger();
+    pollAfterReset();
     if (!ui.root) return;
     if (!ui.host.isConnected && document.body) document.body.append(ui.host); // 页面重建 body 内容时放回去
-    if (tick++ % 4 === 0) applyTheme(pageIsDark() ? 'dark' : 'light');
-    paint(false);
+    // 后台标签页不重绘（输出时本来每 500ms 一次）；切回来时 visibilitychange 标记了 dirty，马上补画
+    if (!document.hidden) {
+      if (tick % 4 === 0) applyTheme(pageIsDark() ? 'dark' : 'light');
+      paint(false);
+    }
+    tick++;
     // 收起时也定期算一次并存下来，下次换会话时能直接用
     if (state.readings.length && Date.now() - quotaAt > 30000) quotaRates();
     if (tick % 20 === 0) pollUsage(false);
@@ -2755,7 +2784,9 @@
     if (!force && !dirty && !active && now - paintedAt < 15000) return;
     dirty = false;
     paintedAt = now;
-    const v = { ...live, turn: lastTurn(), c: contextNow(), lims: limitViews(), t: sessionTotals(), mi: modelInfo(), cache: cacheState() };
+    const c = contextNow();
+    const mi = modelInfo();
+    const v = { ...live, turn: lastTurn(), c, lims: limitViews(), t: sessionTotals(), mi, cache: cacheState(c, mi) };
     if (mode === 'compact') paintCompact(v);
     else {
       paintHeader(v.mi);
@@ -2945,7 +2976,8 @@
         r.row.title = '这个窗口里还没有用量，第一次请求时开始计时。' + fresh;
       } else if (l.expired) {
         r.value.textContent = '已重置 · 待更新';
-        r.row.title = '已过重置时间，新窗口的用量要等下一次请求或额度刷新后才知道。' + fresh;
+        r.row.title =
+          '已过重置时间，新窗口的用量要等下一次请求或额度刷新后才知道（开着额度刷新时，重置后几秒会自动查一次）。' + fresh;
       } else {
         r.value.textContent = fmtPct(l.used) + ' · ' + fmtReset(l.resetsAt) + ' 重置';
         r.row.title = `还有 ${fmtLeft(l.resetsAt)}重置。数值是这里观察到的最大值。` + fresh;
