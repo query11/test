@@ -1,12 +1,12 @@
 # 交接文档
 
-写于 2026-10-20，同一天做完 1.6.0、1.6.1 后更新。接手时先读这份，做完一项就更新这里（全部做完可以删掉）。
+写于 2026-10-20，同一天做完 1.6.0、1.6.1、1.6.2 后更新。接手时先读这份，做完一项就更新这里（全部做完可以删掉）。
 
 ## 现状
 
-- 仓库有一个油猴脚本 `claude-token-meter.user.js`（单文件，约 3110 行）、`README.md`、截图 `shot.png`、`tests/`，以及 CI 配置 `.github/workflows/test.yml`（push / PR 时跑 `node --test`）。
+- 仓库有一个油猴脚本 `claude-token-meter.user.js`（单文件，约 3140 行）、`README.md`、截图 `shot.png`、`tests/`，以及 CI 配置 `.github/workflows/test.yml`（push / PR 时跑 `node --test`）。
 - 默认分支是 `claude/clever-mendel-97x9jy`。README 里的安装链接和 Tampermonkey 的自动更新都指向默认分支（`@updateURL` 用的是 `HEAD`），合并进去用户才会收到新版本。合并后 raw.githubusercontent.com 的 `HEAD` 链接要过几分钟才变（实测约 3 分钟），按分支名的链接马上就是新的。
-- 1.5.1、1.6.0、1.6.1 都已经快进合并进默认分支（2026-10-20），之后的工作从默认分支开始。
+- 1.5.1、1.6.0、1.6.1 都已经快进合并进默认分支（2026-10-20）。1.6.2 在分支 `claude/gallant-shannon-8k18g1` 上，新窗口里先看它合并了没有；没合并就基于这个分支继续，合并了就从默认分支开始。
 
 ### 1.5.1 做了什么
 
@@ -29,22 +29,11 @@
 实现（`claude-token-meter.user.js` 的“用量账本”一节，README 的“用量汇总”一节有面向用户的说明）：
 
 - **记账**：`render()` 发现 `state.rev` 变了就调 `updateLedger()`。每一轮 = `runs()` 同一段里相邻两条 `result` 的累计值之差，记到 `ts || at` 那天（本地时区，`dayKey()`）。轮数只记在这一轮花费最多的模型上，各模型的轮数相加才是总轮数。
-- **去重**：每个会话一条水位线 `{ id, t, c }`（最后记过账的 `result` 的 uuid、时间、各模型累计值），键是 `state.path`（`freshState()` 时的 `location.pathname`，等锁期间切换了会话也记在原来的会话名下）。先按 uuid 找水位线那条，只记它后面的；找不到时按“时间比它晚、累计值又不一样”判断。看不到同一段里的上一条时，累计值各项都不小于水位线的减去水位线，否则从零算。
+- **去重**：1.6.0 按会话记水位线，只记水位线之后的；用真实数据核对时发现两个问题，1.6.2 改成按 uuid 去重，见下面“1.6.2 做了什么”。
 - **多标签页**：在 `navigator.locks.request('ctm-ledger', …)` 里每次从 localStorage 重新读、改、写；没有 Web Locks 时不加锁直接做（Node 里的测试走这条）。其他标签页靠 `storage` 事件刷新显示。
 - **保留**：按天的记录留本月和之前 12 个月；水位线留 60 天（`LEDGER_KEEP_MS`），没有水位线的会话，60 天以前的 `result` 不记。
 - **展示**：底栏第一个按钮“汇总”切到汇总视图（再点“返回”）。顶部“今天 / 本周 / 本月”，主数字是等价费用，下面日期范围、轮数、日均；近 30 天每天费用的柱状图（本栏的几天用强调色，整列都是悬停范围，键盘聚焦后可以用左右方向键）；输出 / 输入 / 缓存读 / 缓存写；按 `modelName()` 合并后每个模型一行；底部是“只统计在这个浏览器打开过的会话”（悬停有完整说明）和“导出 CSV”。
 - **控制台**：`__ctm.usage('day' | 'week' | 'month')`、`__ctm.ledger`、`__ctm.usageCsv()`；`diagnostics().ledger` 只有天数、会话数、最后更新时间、字节数，不含会话路径。
-
-账本格式（`ctm-ledger`）：
-
-```json
-{
-  "v": 1,
-  "at": 1792461600000,
-  "days": { "2026-10-20": { "claude-opus-5-5": [输入, 输出, 缓存读, 缓存写, 美元, 轮数] } },
-  "sessions": { "/code/session_…": { "id": "<result uuid>", "t": 1792461600000, "c": { "claude-opus-5-5": [输入, 输出, 缓存读, 缓存写, 美元] } } }
-}
-```
 
 没有 `modelUsage`、只有 `total_cost_usd` 的 result 记在空字符串模型名下，显示为“未知模型”，CSV 里写 `unknown`。
 
@@ -56,20 +45,49 @@
 4. 小改动：$1000 以上的费用加千分位、不带美分（`fmtCost`）；底栏按钮的内边距缩小，打开“调试”时版本号不再被截掉。
 5. CI：`.github/workflows/test.yml`。
 
+### 1.6.2 做了什么：账本按 uuid 去重
+
+用户装上 1.6.1 后在真实页面上做了检查（在控制台跑一段只输出编号、时间、累计费用的代码），结果：
+
+- **已验证**：同一轮实时到达和刷新后在历史里的 uuid、时间戳都一样；刷新后“今天”不变。
+- **问题 1，重复记账**：账本里两个不同的会话地址（末尾 `Z9mE`、`AVb9`）的水位线是同一轮（同一个 uuid、同一个时间，10/19 12:23 UTC），说明同一段历史出现在两个会话地址下，各记了一次。为什么两个会话会有同一段历史还不知道（问了用户是不是复制 / 分叉过会话，还没回答）。
+- **问题 2，漏记**：测试的那个会话在 10/13 有 2 轮，账本里却没有 10/13 这一天。刷新前那个标签页里只有最新一轮、没有历史，账本第一次见到这个会话时把水位线定在了这一轮；刷新后历史里更早的都在水位线之前，全被跳过。为什么那个标签页里没有历史也还不知道（问了用户是不是从侧栏点进去的，还没回答）。猜测是网页先加载会话历史、后改地址，脚本在 `onNav` 里 `reset()` 把刚读到的历史清掉了；这样的话面板上的会话累计费用在刷新前也是错的（只算了最新一轮）。
+
+改法（用户同意清空旧账本）：
+
+- 新键 `ctm-ledger-v2`，`v: 2`，加载时删掉旧的 `ctm-ledger`。旧格式没有记过账的 uuid，接上去重开会话会重复记，所以不迁移。
+- `ids` 按天存记过账的 result 的 uuid 前 12 位（`idOf()`），不分会话，保留 60 天。
+- 每一段从它最后一条记过账的之后开始记：之前的要么记过，要么已经含在那一条里（它看不到上一条时按整段累计值记的），要么超过保留期。没有记过账的段从头记，所以晚到的更早历史能补上。
+- `sessions` 还在，是这个会话最后一条记过账的（包括在别的会话地址下记的），只在它不在这次加载的历史里时用：不晚于它、累计值和它一样的算记过；之后的第一条看不到上一条、累计值又都不小于它时减去它。
+- `onNav` 加了 `log('navigate', …)`，打开“调试”后可以和 fetch / websocket 的日志对照，看历史是在切换会话之前还是之后加载的。
+- `diagnostics().ledger` 多了 `turns`（记过账的轮数）。
+
+账本格式（`ctm-ledger-v2`）：
+
+```json
+{
+  "v": 2,
+  "at": 1792461600000,
+  "days": { "2026-10-20": { "claude-opus-5-5": [输入, 输出, 缓存读, 缓存写, 美元, 轮数] } },
+  "ids": { "2026-10-20": "c1cf2d44-xxx 9e2e7d34-xxx" },
+  "sessions": { "/code/session_…": { "id": "<uuid 前 12 位>", "t": 1792461600000, "c": { "claude-opus-5-5": [输入, 输出, 缓存读, 缓存写, 美元] } } }
+}
+```
+
 ### 测试
 
-在仓库根目录运行 `node --test`（Node 20 以上，不用装依赖），目前 41 个用例全部通过。CI 在 push / PR 时也跑。
+在仓库根目录运行 `node --test`（Node 20 以上，不用装依赖），目前 44 个用例全部通过。CI 在 push / PR 时也跑。
 
 - `tests/harness.js`：在 Node 里加载脚本，桩掉浏览器对象，时间由测试控制（`advance` / `wait`），不建 UI。`opts.storage` 传 `Map` 时直接共用（模拟同一浏览器的几个标签页），传对象时拷贝一份；`opts.locks` 是 `navigator.locks` 的替身；`opts.fetch` 是页面的 `fetch`（查用量接口也用它），`opts.cookie` 里放 `lastActiveOrg=<组织 id>`；脚本里不带参数的 `new Date()` 也跟着测试的时钟走。`render()` 在建 UI 之前就返回，所以记账、重置后刷新这类放在 UI 检查之前的逻辑会跑，正常的定时轮询、重绘不会跑。
 - `streaming.test.js`、`forecast.test.js`、`totals.test.js`：实时流、额度预测、累计值。
 - `quota.test.js`：额度合并、每 1% 折合美元（读数回落、闲置、只加载了部分历史时不覆盖）。
 - `poll.test.js`：重置几秒后查一次并换上新窗口；重置后已有新读数不查；返回里没有这个窗口、请求失败时只查一次；关掉额度刷新时不查。
-- `ledger.test.js`（14 个）：刷新和多个标签页不重复记、uuid 对不上、本机时钟偏快、`/clear` 和子代理、只加载部分历史、加锁路径、跨午夜、保留期、今天 / 本周 / 本月、CSV 和诊断。
-- `CTM_SCRIPT=<文件> node --test` 可以拿别的版本跑同一组用例。账本的每个保护、重置后刷新的两个条件（读数早于重置、每次重置只查一次）都单独去掉验证过，去掉之后对应用例会失败。
+- `ledger.test.js`（17 个）：刷新和多个标签页不重复记、uuid 对不上、本机时钟偏快、`/clear` 和子代理、只加载部分历史、同一段历史在两个会话地址下、先看到最新一轮后来才加载历史、先看到段中间的一轮、加锁路径、跨午夜、保留期、今天 / 本周 / 本月、CSV 和诊断。
+- `CTM_SCRIPT=<文件> node --test` 可以拿别的版本跑同一组用例。账本的每个保护（1.6.2 的按 uuid 去重、段内被包含、水位线只在不可见时用，以及之前的几条）、重置后刷新的两个条件（读数早于重置、每次重置只查一次）都单独去掉验证过，去掉之后对应用例会失败。
 - 事件是照着脚本解析的格式手工构造的，**不是录下来的真实数据**。
 - 界面没有自动化测试，是用 Playwright 手动看的：`page.route('https://claude.ai/**', …)` 返回一个空页面，`page.addInitScript` 先往 localStorage 里放假数据再注入脚本，`__ctm.ingest` 喂几条 result，点按钮后截图。容器里有 Chromium（`/opt/pw-browsers`）和全局的 `playwright` 包（`NODE_PATH=$(npm root -g)`）。后台标签页不重绘这一条没有测（Playwright 不好模拟页面隐藏）。
 
-## 代码地图（行号以 1.6.1 为准）
+## 代码地图（行号以 1.6.2 为准）
 
 | 位置（`claude-token-meter.user.js`） | 内容 |
 | --- | --- |
@@ -82,13 +100,13 @@
 | `:1023` 统计 | `runs()` 按 `/clear` 分段，`sessionTotals()`、`lastTurn()`、`contextNow()` |
 | `:1144` 提示缓存 | 价目表 `CACHE_PRICES`、`cacheState()`（过期时间、重建次数和原因） |
 | `:1252` 额度折合多少钱 | `sessionQuotaRates()`：每轮花费按 result 差值分摊到请求，再和额度跳变对齐；`quotaRates()` 按会话存进 `ctm-rates-v4` 再合并 |
-| `:1513` 用量账本 | `updateLedger()`（水位线、加锁）、`addTurn`、`pruneLedger`、`usageSummary()`、`ledgerCsv()`、`ledgerStats()` |
-| `:1698` 网络挂钩 | fetch / XHR / WebSocket / EventSource，切换会话时 `reset()` |
-| `:1851` 主动刷新额度 | `pollUsage()`：每 3 分钟查一次用量接口，多标签页共用；`pollAfterReset()`（`:1906`） |
-| `:1966` UI | shadow DOM 面板；`buildSummary()`（`:2507`）、`drawBars()` / `paintSummary()`（`:2710`）；`render()`（`:2743`）每 500ms 一次，`paint()` → `paintCompact` / `paintFull` / `paintSummary`，再 `paintFoot` |
-| `:3079` `W.__ctm` | 控制台接口，测试也通过它 |
+| `:1513` 用量账本 | `updateLedger()`（`:1601`，按 uuid 去重、加锁）、`addTurn`、`pruneLedger`、`usageSummary()`、`ledgerCsv()`、`ledgerStats()` |
+| `:1728` 网络挂钩 | fetch / XHR / WebSocket / EventSource，切换会话时 `reset()`（`onNav`） |
+| `:1882` 主动刷新额度 | `pollUsage()`：每 3 分钟查一次用量接口，多标签页共用；`pollAfterReset()`（`:1937`） |
+| `:1997` UI | shadow DOM 面板；`buildSummary()`（`:2538`）、`drawBars()` / `paintSummary()`（`:2741`）；`render()`（`:2774`）每 500ms 一次，`paint()` → `paintCompact` / `paintFull` / `paintSummary`，再 `paintFoot` |
+| `:3110` `W.__ctm` | 控制台接口，测试也通过它 |
 
-localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-hist`、`ctm-rates-v4`、`ctm-ledger`、`ctm-poll`、`ctm-poll-at`、`ctm-mode`、`ctm-anchor`、`ctm-debug`。汇总视图选的是哪一栏、是否在汇总视图，只存在内存里。
+localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-hist`、`ctm-rates-v4`、`ctm-ledger-v2`（旧的 `ctm-ledger` 加载时删掉）、`ctm-poll`、`ctm-poll-at`、`ctm-mode`、`ctm-anchor`、`ctm-debug`。汇总视图选的是哪一栏、是否在汇总视图，只存在内存里。
 
 ## 待办
 
@@ -96,13 +114,14 @@ localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-his
 
 ### 1. 用真实数据核对（需要用户配合）
 
-账本、重置后刷新都只用合成事件测过。值得在真实页面上确认：
+已经核对过的见“1.6.2 做了什么”。还没核对的：
 
-- 历史里的 `result` 和实时到达的是不是同一个 uuid（不是的话靠时间和累计值兜底，也能去重）；分页加载历史时有没有重复记；
-- `/code` 新建会话时，第一轮的 `result` 会不会在 URL 变成 `/code/session_…` 之前到达（那样会在 `/code` 和新会话下各记一次；推测 URL 先变，没有核实）；
+- 两个问题的成因：两个会话为什么有同一段历史（复制 / 分叉？）；从侧栏切换会话时历史是不是在改地址之前加载的（打开“调试”，切换会话，看 `navigate` 和 fetch / websocket 日志的先后）。如果是后者，`reset()` 会把刚读到的历史清掉，面板上的会话累计值在刷新前是错的，要修（比如按响应的 URL 判断数据属于哪个会话，切换后把刚读到的属于新会话的数据重新喂一遍）。
+- 同一个会话开两个标签页，一轮结束后“今天”只增加一次；
+- 从 `/code` 新建会话，第一轮只记一次（`diagnostics()` 或账本的 `sessions` 里不该出现 `/code` 这样的非会话地址）；
 - 窗口重置后用量接口多久切到新窗口：如果常常要十几秒以上，`RESET_GRACE_MS` 可以加大，或者允许每次重置查两次。
 
-做法：打开“调试”录一段真实的事件流，去掉对话内容后存成 fixture，作为合成用例的补充。注意隐私，只留结构和数字。
+用户的账本里还有一条记在项目频道页面 `/code/project/chan_…` 下的水位线（10/19），说明频道页面上也能看到 result；按 uuid 去重之后，同一轮在频道页面和会话页面各看到一次也只记一次。
 
 ### 2. “当前 7 天额度窗口内”的花费（用户说先不做）
 

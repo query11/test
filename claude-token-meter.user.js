@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.6.1
+// @version      1.6.2
 // @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示模型、推理强度、token 用量、生成速度、提示缓存与订阅额度
 // @homepageURL  https://github.com/query11/test
 // @downloadURL  https://raw.githubusercontent.com/query11/test/HEAD/claude-token-meter.user.js
@@ -37,7 +37,7 @@
   const W = window;
   if (W.__ctm) return;
 
-  const VERSION = '1.6.1';
+  const VERSION = '1.6.2';
   const FLOW_MS = 1500; // 这么久内收到过 token 视为“正在输出”
   // 流式请求这么久没动静就不再显示为进行中（防止漏掉 message_stop 时一直亮着）。只影响显示：
   // 这一路的统计留着，之后再来增量照常计入，真正结束看 message_stop / 下一个 message_start / result
@@ -1513,13 +1513,20 @@
   // ---------------------------------------------------------------- 用量账本（按天汇总）
 
   // 每轮的用量 = 同一段里相邻两条 result 的累计值之差（CLI 算好的精确值，含子代理），记到这一轮结束的那天。
-  // 同一轮会被看到好几次：实时一次，刷新或重开会话时历史里又一次，开在两个标签页里各一次。所以每个会话记一条
-  // 水位线（最后记过账的那条 result 和它的累计值），只记它后面的
-  // { v, at, days: { 'YYYY-MM-DD': { 模型: [输入, 输出, 缓存读, 缓存写, 美元, 轮数] } }, sessions: { 路径: { id, t, c: { 模型: [输入, 输出, 缓存读, 缓存写, 美元] } } } }
-  const LEDGER_KEY = 'ctm-ledger';
-  // 水位线保留这么久。没有水位线的会话，更早的 result 也不记：水位线清掉之后重开旧会话，不会重复记账
+  // 同一轮会被看到好几次：实时一次，刷新或重开会话时历史里又一次，开在两个标签页里各一次，两个会话地址下的历史
+  // 也可能有同一段（实测见过）。所以不分会话，按 result 的 uuid 记下哪些轮记过账，只记没记过的
+  // { v: 2, at, days: { 'YYYY-MM-DD': { 模型: [输入, 输出, 缓存读, 缓存写, 美元, 轮数] } },
+  //   ids: { 'YYYY-MM-DD': 那天记过账的 uuid 前 12 位，空格分隔 },
+  //   sessions: { 路径: { id, t, c: { 模型: [输入, 输出, 缓存读, 缓存写, 美元] } } } }
+  // sessions 是每个会话最后一条记过账的 result，历史只加载了一部分、看不到同一段里的上一条时拿它的累计值做减数。
+  // v1 只按会话记水位线：同一轮出现在两个会话地址下会记两次，水位线之前晚到的历史又永远补不上。和 v2 接不上，换了新键
+  const LEDGER_KEY = 'ctm-ledger-v2';
+  // 记过账的 uuid 和水位线保留这么久；比这更早的 result 不记，否则 uuid 清掉之后重开旧会话会重复记账
   const LEDGER_KEEP_MS = 60 * 864e5;
   const ZERO = [0, 0, 0, 0, 0];
+  try {
+    localStorage.removeItem('ctm-ledger');
+  } catch {}
 
   // 本地时区的日期
   const dayKey = (t) => {
@@ -1529,8 +1536,11 @@
 
   function readLedger() {
     const x = lsJSON(LEDGER_KEY, null);
-    return x && x.v === 1 && x.days && x.sessions ? x : { v: 1, at: 0, days: {}, sessions: {} };
+    return x && x.v === 2 && x.days && x.ids && x.sessions ? x : { v: 2, at: 0, days: {}, ids: {}, sessions: {} };
   }
+
+  // 记账用的编号：uuid 前 12 位。没有 uuid 的 result（少见）用累计费用和输出量代替
+  const idOf = (r) => (r.id ? r.id.slice(0, 12) : '#' + Math.round(r.cost * 1e6) + '.' + (r.totals ? r.totals.output : 0));
   let ledger = readLedger();
   let ledgerSeen = null; // 上次记账时的状态和版本
   let ledgerBusy = false;
@@ -1559,6 +1569,7 @@
     }
     return true;
   }
+  const sameCum = (a, b) => covers(a, b) && covers(b, a);
 
   // 这一轮的用量（累计值 c 减去 base）加到那天。轮数只记在花费最多的模型上，各模型的轮数相加就是总轮数
   function addTurn(book, day, c, base) {
@@ -1575,44 +1586,62 @@
     if (top) book.days[day][top[0]][5]++;
   }
 
-  // 按天的记录留本月和之前 12 个月；水位线留 LEDGER_KEEP_MS
+  // 按天的记录留本月和之前 12 个月；记过账的 uuid 和水位线留 LEDGER_KEEP_MS
   function pruneLedger(book, now) {
     const d = new Date(now);
     const first = dayKey(new Date(d.getFullYear(), d.getMonth() - 12, 1).getTime());
     for (const k in book.days) if (k < first) delete book.days[k];
+    const keep = dayKey(now - LEDGER_KEEP_MS);
+    for (const k in book.ids) if (k < keep) delete book.ids[k];
     for (const k in book.sessions) if (!(now - num(book.sessions[k] && book.sessions[k].t) < LEDGER_KEEP_MS)) delete book.sessions[k];
   }
 
-  // 把这个会话里水位线之后的几轮记进账本。账本每次都从 localStorage 重新读，并且在多个标签页之间加锁：
+  // 把这个会话里还没记过账的几轮记进账本。账本每次都从 localStorage 重新读，并且在多个标签页之间加锁：
   // 另一个标签页刚记过的，这里就不会再记
   function updateLedger() {
     if (ledgerBusy) return;
     const st = state; // 等锁期间切换了会话也照样记在原来的会话名下
     ledgerSeen = { state: st, rev: st.rev };
     const work = safe(() => {
-      const list = []; // [result, 同一段里的上一条, 第几段]
-      runs(st).forEach((run, i) => run.forEach((r, j) => list.push([r, run[j - 1], i])));
+      const list = runs(st);
       if (!list.length) return;
       const now = Date.now();
       const book = (ledger = readLedger()); // 显示也跟着用最新的
+      const booked = new Set(Object.values(book.ids).join(' ').split(' '));
       const mark = book.sessions[st.path];
-      const k = mark && mark.id ? list.findIndex(([r]) => r.id === mark.id) : -1;
-      let last = null;
-      for (let n = k + 1; n < list.length; n++) {
-        const [r, prev, run] = list[n];
-        const t = r.ts || r.at;
-        const c = cumOf(r);
-        // 没找到水位线那条（比如历史只加载了一部分）：按时间比它晚、累计值又和它不一样来判断是新的
-        if (mark && k < 0 && (t <= mark.t || (covers(c, mark.c) && covers(mark.c, c)))) continue;
-        last = [r, t, c];
-        if (now - t > LEDGER_KEEP_MS) continue;
-        // 看不到同一段里的上一条（历史只加载了一部分）：各项都不小于水位线的，和水位线在同一段，减去水位线；
-        // 否则是新的一段，从零开始
-        const base = prev ? cumOf(prev) : run === 0 && mark && k < 0 && covers(c, mark.c) ? mark.c : null;
-        addTurn(book, dayKey(t), c, base);
+      // 水位线那条不在这次加载到的历史里（历史只加载了一部分，或者 uuid 对不上）：不晚于它的、累计值和它一样的都算记过
+      const hidden = !!mark && !list.some((run) => run.some((r) => idOf(r) === mark.id));
+      let changed = false;
+      let first = true;
+      for (const run of list) {
+        // 一段里最后一条记过账的之前都不用再看：它们要么记过，要么已经含在那一条里（它看不到上一条时按整段累计值记），
+        // 要么超过了保留期。没记过账的段从头记，这样先看到最新一轮、后来才加载到的历史也能补上
+        let start = 0;
+        run.forEach((r, j) => {
+          if (booked.has(idOf(r)) || (hidden && ((r.ts || r.at) <= mark.t || sameCum(cumOf(r), mark.c)))) start = j + 1;
+        });
+        for (let j = start; j < run.length; j++) {
+          const r = run[j];
+          const t = r.ts || r.at;
+          const c = cumOf(r);
+          // 看不到同一段里的上一条：水位线之后的第一条各项都不小于水位线的，和水位线在同一段，减去水位线；否则是新的一段，从零开始
+          const base = j ? cumOf(run[j - 1]) : first && hidden && covers(c, mark.c) ? mark.c : null;
+          first = false;
+          if (now - t > LEDGER_KEEP_MS) continue;
+          addTurn(book, dayKey(t), c, base);
+          booked.add(idOf(r));
+          book.ids[dayKey(t)] = (book.ids[dayKey(t)] ? book.ids[dayKey(t)] + ' ' : '') + idOf(r);
+          changed = true;
+        }
       }
-      if (!last) return;
-      book.sessions[st.path] = { id: last[0].id, t: last[1], c: last[2] };
+      // 水位线：这个会话里最后一条记过账的，包括在别的会话地址下记的
+      let last = null;
+      for (const run of list) for (const r of run) if (booked.has(idOf(r))) last = r;
+      if (last && !(mark && mark.id === idOf(last))) {
+        book.sessions[st.path] = { id: idOf(last), t: last.ts || last.at, c: cumOf(last) };
+        changed = true;
+      }
+      if (!changed) return;
       pruneLedger(book, now);
       book.at = now;
       lsSet(LEDGER_KEY, JSON.stringify(book));
@@ -1688,6 +1717,7 @@
     return {
       days: days.length,
       first: days[0] || null,
+      turns: Object.values(ledger.ids).reduce((s, x) => s + x.split(' ').length, 0),
       sessions: Object.keys(ledger.sessions).length,
       thisSession: !!ledger.sessions[state.path],
       at: ledger.at ? new Date(ledger.at).toISOString() : null,
@@ -1835,6 +1865,7 @@
   const onNav = () => {
     if (location.pathname !== lastPath) {
       lastPath = location.pathname;
+      log('navigate', lastPath); // 和 fetch / websocket 的日志对照，看历史是在切换会话之前还是之后加载的
       reset();
     }
   };

@@ -6,6 +6,7 @@ const { load, result } = require('./harness');
 const OPUS = 'claude-opus-5-5';
 const HAIKU = 'claude-haiku-5-5';
 const P = '/code/session_0123456789abcdefghij';
+const LEDGER = 'ctm-ledger-v2';
 const MIN = 60000;
 const DAY = 864e5;
 
@@ -156,7 +157,7 @@ test('同一个会话开在两个标签页：两边交替看到同样的事件�
   }
   near(today(a).cost, 5);
   assert.equal(today(a).turns, 5);
-  near(JSON.parse(store.get('ctm-ledger')).days[key(20)][OPUS][4], 5);
+  near(JSON.parse(store.get(LEDGER)).days[key(20)][OPUS][4], 5);
 });
 
 test('两个标签页开着不同的会话：各自记账，不会互相覆盖', () => {
@@ -170,9 +171,63 @@ test('两个标签页开着不同的会话：各自记账，不会互相覆盖',
   a.advance(MIN);
   a.feed(cum(1.5));
   a.render();
-  const book = JSON.parse(store.get('ctm-ledger'));
+  const book = JSON.parse(store.get(LEDGER));
   near(book.days[key(20)][OPUS][4], 3.5);
   assert.equal(Object.keys(book.sessions).length, 2);
+});
+
+test('同一段历史出现在两个会话地址下（比如复制出来的会话）：只记一次', () => {
+  const store = new Map();
+  const a = load({ now: local(20, 10), storage: store, path: '/code/session_aaaaaaaaaaaaaaaaaaaa' });
+  const r1 = cum(1);
+  const r2 = cum(2);
+  a.feed(r1);
+  a.advance(MIN);
+  a.feed(r2);
+  a.render();
+  const b = load({ now: local(20, 11), storage: store, path: '/code/session_bbbbbbbbbbbbbbbbbbbb' });
+  b.feed(history(at(r1, local(20, 10)), at(r2, local(20, 10, 1))));
+  b.render();
+  near(today(b).cost, 2);
+  b.feed(cum(2.5)); // 在新会话里接着做
+  b.render();
+  near(today(b).cost, 2.5);
+  assert.equal(today(b).turns, 3);
+});
+
+test('先看到最新一轮、后来才加载到历史：更早的几段补记到各自的日期，再刷新也不重复', () => {
+  const store = new Map();
+  const now = local(20, 21, 43);
+  const live = cum(0.17); // 这一段的第一轮（之前续接时累计值从零重新开始）
+  const h = load({ now, storage: store });
+  h.feed(live);
+  h.render();
+  near(today(h).cost, 0.17);
+  const past = [at(cum(4.2), local(13, 21, 35)), at(cum(7.6), local(13, 23, 29)), at(cum(4.5), local(20, 18)), at(cum(10), local(20, 21, 37)), at(live, now)];
+  for (const m of [2, 3]) {
+    const h2 = load({ now: now + m * MIN, storage: store });
+    h2.feed(history(...past));
+    h2.render();
+    const days = h2.ctm.ledger.days;
+    near(days[key(13)][OPUS][4], 7.6);
+    assert.equal(days[key(13)][OPUS][5], 2);
+    near(today(h2).cost, 10.17);
+    assert.equal(today(h2).turns, 3);
+  }
+});
+
+test('先看到一段中间的一轮（按整段累计值记了），后来才加载到这一段更早的几轮：不再重复记', () => {
+  const store = new Map();
+  const r5 = cum(5);
+  const h = load({ now: local(20, 12), storage: store });
+  h.feed(r5);
+  h.render();
+  near(today(h).cost, 5);
+  const h2 = load({ now: local(20, 12, 5), storage: store });
+  h2.feed(history(at(cum(1), local(20, 9)), at(cum(3), local(20, 10)), at(r5, local(20, 12))));
+  h2.render();
+  near(today(h2).cost, 5);
+  assert.equal(today(h2).turns, 1);
 });
 
 test('支持 Web Locks 时在锁里记账；等锁期间新来的也会记上', async () => {
@@ -218,21 +273,25 @@ test('没有水位线的会话：60 天以前的 result 不记', () => {
   assert.ok(h.ctm.ledger.sessions[P]);
 });
 
-test('账本清理：按天的记录留本月和之前 12 个月，水位线留 60 天', () => {
+test('账本清理：按天的记录留本月和之前 12 个月，记过账的编号和水位线留 60 天；旧版账本删掉', () => {
   const now = local(20);
   const old = { id: 'r-old', t: now - 61 * DAY, c: {} };
   const storage = {
-    'ctm-ledger': JSON.stringify({
-      v: 1,
+    [LEDGER]: JSON.stringify({
+      v: 2,
       days: { '2025-09-30': { [OPUS]: [1, 1, 1, 1, 1, 1] }, '2025-10-01': { [OPUS]: [1, 1, 1, 1, 2, 1] } },
+      ids: { '2026-08-19': 'aaaaaaaaaaaa', '2026-08-21': 'bbbbbbbbbbbb cccccccccccc' },
       sessions: { '/code/session_old': old, '/code/session_recent': { ...old, t: now - 59 * DAY } },
     }),
+    'ctm-ledger': JSON.stringify({ v: 1, days: {}, sessions: {} }),
   };
   const h = load({ now, storage });
+  assert.equal(h.store.has('ctm-ledger'), false);
   h.feed(cum(1));
   h.render();
   const book = h.ctm.ledger;
   assert.deepEqual(Object.keys(book.days).sort(), ['2025-10-01', key(20)]);
+  assert.deepEqual(Object.keys(book.ids).sort(), ['2026-08-21', key(20)]); // 8/21 离今天正好 60 天
   assert.deepEqual(Object.keys(book.sessions).sort(), [P, '/code/session_recent']);
 });
 
@@ -245,7 +304,7 @@ function seeded(now) {
     [key(19)]: { [OPUS]: [1, 400, 0, 0, 2, 1] },
     [key(20)]: { [OPUS]: [10, 500, 9000, 800, 3, 2], 'claude-opus-5-5-20261001': [5, 50, 0, 0, 0.5, 1], [HAIKU]: [2, 20, 0, 0, 0.5, 0] },
   };
-  return load({ now, storage: { 'ctm-ledger': JSON.stringify({ v: 1, at: now, days, sessions: {} }) } });
+  return load({ now, storage: { [LEDGER]: JSON.stringify({ v: 2, at: now, days, ids: {}, sessions: {} }) } });
 }
 
 test('今天 / 本周（周一开始）/ 本月的合计，模型按显示名合并', () => {
