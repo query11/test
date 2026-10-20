@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.5.1
+// @version      1.6.0
 // @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示模型、推理强度、token 用量、生成速度、提示缓存与订阅额度
 // @homepageURL  https://github.com/query11/test
 // @downloadURL  https://raw.githubusercontent.com/query11/test/HEAD/claude-token-meter.user.js
@@ -37,7 +37,7 @@
   const W = window;
   if (W.__ctm) return;
 
-  const VERSION = '1.5.1';
+  const VERSION = '1.6.0';
   const FLOW_MS = 1500; // 这么久内收到过 token 视为“正在输出”
   // 流式请求这么久没动静就不再显示为进行中（防止漏掉 message_stop 时一直亮着）。只影响显示：
   // 这一路的统计留着，之后再来增量照常计入，真正结束看 message_stop / 下一个 message_start / result
@@ -75,6 +75,7 @@
 
   function freshState() {
     return {
+      path: location.pathname, // 这份状态属于哪个会话：账本按它记水位线，切换会话时状态会整个换掉
       seen: new Set(), // 已处理的事件 uuid
       seq: 0, // 到达顺序
       rev: 0, // result 和 /clear 记录的版本，分段结果按它缓存
@@ -233,6 +234,7 @@
     const end = start && num(o.duration_ms) ? start + o.duration_ms : 0;
     const r = {
       ...stamp(ctx, end),
+      id: typeof o.uuid === 'string' ? o.uuid : '', // 账本按它找上次记到哪一条
       cost,
       totals: models ? totals : null,
       byModel,
@@ -1023,18 +1025,18 @@
   // 累计值在 /clear 之后、或者续接时没有存档的情况下会从零重新开始。按先后把 result 分成几段（同一段里
   // 累计值只增不减），各段最后一条相加才是整个会话的用量
   let runsCache = null;
-  function runs() {
-    if (runsCache && runsCache.state === state && runsCache.rev === state.rev) return runsCache.list;
+  function runs(s = state) {
+    if (runsCache && runsCache.state === s && runsCache.rev === s.rev) return runsCache.list;
     const list = [];
     let cur = null;
     let prev = null;
-    for (const r of state.results) {
+    for (const r of s.results) {
       if (prev && sameResult(prev, r)) continue; // 同一条 result 从两个通道各来了一次，或者是没有请求的一轮
-      if (!prev || restarted(prev, r)) list.push((cur = []));
+      if (!prev || restarted(prev, r, s.resets)) list.push((cur = []));
       cur.push(r);
       prev = r;
     }
-    runsCache = { state, rev: state.rev, list };
+    runsCache = { state: s, rev: s.rev, list };
     return list;
   }
 
@@ -1043,13 +1045,13 @@
     return !a.totals || KINDS.every((k) => a.totals[k] === b.totals[k]);
   }
 
-  function restarted(p, r) {
+  function restarted(p, r, resets) {
     if (r.cost < p.cost - 1e-6) return true;
     if (p.totals && r.totals) {
       for (const k of KINDS) if (r.totals[k] < p.totals[k]) return true;
       for (const name in p.byModel) if (!r.byModel[name]) return true; // 某个模型的累计值不见了
     }
-    return state.resets.some((z) => isAfter(z, p) && isAfter(r, z)); // 两条之间有 /clear
+    return resets.some((z) => isAfter(z, p) && isAfter(r, z)); // 两条之间有 /clear
   }
 
   function sessionTotals() {
@@ -1504,6 +1506,191 @@
     return (quotaCache = out);
   }
 
+  // ---------------------------------------------------------------- 用量账本（按天汇总）
+
+  // 每轮的用量 = 同一段里相邻两条 result 的累计值之差（CLI 算好的精确值，含子代理），记到这一轮结束的那天。
+  // 同一轮会被看到好几次：实时一次，刷新或重开会话时历史里又一次，开在两个标签页里各一次。所以每个会话记一条
+  // 水位线（最后记过账的那条 result 和它的累计值），只记它后面的
+  // { v, at, days: { 'YYYY-MM-DD': { 模型: [输入, 输出, 缓存读, 缓存写, 美元, 轮数] } }, sessions: { 路径: { id, t, c: { 模型: [输入, 输出, 缓存读, 缓存写, 美元] } } } }
+  const LEDGER_KEY = 'ctm-ledger';
+  // 水位线保留这么久。没有水位线的会话，更早的 result 也不记：水位线清掉之后重开旧会话，不会重复记账
+  const LEDGER_KEEP_MS = 60 * 864e5;
+  const ZERO = [0, 0, 0, 0, 0];
+
+  // 本地时区的日期
+  const dayKey = (t) => {
+    const d = new Date(t);
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  };
+
+  function readLedger() {
+    const x = lsJSON(LEDGER_KEY, null);
+    return x && x.v === 1 && x.days && x.sessions ? x : { v: 1, at: 0, days: {}, sessions: {} };
+  }
+  let ledger = readLedger();
+  let ledgerSeen = null; // 上次记账时的状态和版本
+  let ledgerBusy = false;
+  W.addEventListener('storage', (e) => {
+    if (e.key !== LEDGER_KEY) return;
+    ledger = readLedger();
+    dirty = true;
+  });
+
+  // 一条 result 里各模型的累计值。没有 modelUsage、只有总费用的记在空模型名下
+  function cumOf(r) {
+    const c = {};
+    for (const name in r.byModel) {
+      const x = r.byModel[name];
+      c[name] = [x.input, x.output, x.cacheRead, x.cacheWrite, x.cost];
+    }
+    if (!Object.keys(c).length && r.cost) c[''] = [0, 0, 0, 0, r.cost];
+    return c;
+  }
+
+  // b 的每一项都不小于 a：b 和 a 在同一段里，并且不早于 a
+  function covers(b, a) {
+    for (const name in a) {
+      if (!b[name]) return false;
+      for (let i = 0; i < 5; i++) if (b[name][i] < a[name][i] - 1e-9) return false;
+    }
+    return true;
+  }
+
+  // 这一轮的用量（累计值 c 减去 base）加到那天。轮数只记在花费最多的模型上，各模型的轮数相加就是总轮数
+  function addTurn(book, day, c, base) {
+    let top = null;
+    for (const name in c) {
+      const b = (base && base[name]) || ZERO;
+      const x = c[name].map((v, i) => Math.max(0, v - b[i]));
+      if (!x.some((v) => v > 0)) continue;
+      const e = ((book.days[day] ||= {})[name] ||= [0, 0, 0, 0, 0, 0]);
+      for (let i = 0; i < 5; i++) e[i] += x[i];
+      e[4] = +e[4].toFixed(6);
+      if (!top || x[4] > top[1][4] || (x[4] === top[1][4] && x[1] > top[1][1])) top = [name, x];
+    }
+    if (top) book.days[day][top[0]][5]++;
+  }
+
+  // 按天的记录留本月和之前 12 个月；水位线留 LEDGER_KEEP_MS
+  function pruneLedger(book, now) {
+    const d = new Date(now);
+    const first = dayKey(new Date(d.getFullYear(), d.getMonth() - 12, 1).getTime());
+    for (const k in book.days) if (k < first) delete book.days[k];
+    for (const k in book.sessions) if (!(now - num(book.sessions[k] && book.sessions[k].t) < LEDGER_KEEP_MS)) delete book.sessions[k];
+  }
+
+  // 把这个会话里水位线之后的几轮记进账本。账本每次都从 localStorage 重新读，并且在多个标签页之间加锁：
+  // 另一个标签页刚记过的，这里就不会再记
+  function updateLedger() {
+    if (ledgerBusy) return;
+    const st = state; // 等锁期间切换了会话也照样记在原来的会话名下
+    ledgerSeen = { state: st, rev: st.rev };
+    const work = safe(() => {
+      const list = []; // [result, 同一段里的上一条, 第几段]
+      runs(st).forEach((run, i) => run.forEach((r, j) => list.push([r, run[j - 1], i])));
+      if (!list.length) return;
+      const now = Date.now();
+      const book = (ledger = readLedger()); // 显示也跟着用最新的
+      const mark = book.sessions[st.path];
+      const k = mark && mark.id ? list.findIndex(([r]) => r.id === mark.id) : -1;
+      let last = null;
+      for (let n = k + 1; n < list.length; n++) {
+        const [r, prev, run] = list[n];
+        const t = r.ts || r.at;
+        const c = cumOf(r);
+        // 没找到水位线那条（比如历史只加载了一部分）：按时间比它晚、累计值又和它不一样来判断是新的
+        if (mark && k < 0 && (t <= mark.t || (covers(c, mark.c) && covers(mark.c, c)))) continue;
+        last = [r, t, c];
+        if (now - t > LEDGER_KEEP_MS) continue;
+        // 看不到同一段里的上一条（历史只加载了一部分）：各项都不小于水位线的，和水位线在同一段，减去水位线；
+        // 否则是新的一段，从零开始
+        const base = prev ? cumOf(prev) : run === 0 && mark && k < 0 && covers(c, mark.c) ? mark.c : null;
+        addTurn(book, dayKey(t), c, base);
+      }
+      if (!last) return;
+      book.sessions[st.path] = { id: last[0].id, t: last[1], c: last[2] };
+      pruneLedger(book, now);
+      book.at = now;
+      lsSet(LEDGER_KEY, JSON.stringify(book));
+      dirty = true;
+    });
+    const locks = typeof navigator !== 'undefined' && navigator.locks;
+    if (!locks) return void work(); // 不支持 Web Locks 的环境（以及 Node 里的测试）不加锁
+    ledgerBusy = true;
+    new Promise((ok) => ok(locks.request('ctm-ledger', work)))
+      .catch(() => {})
+      .then(() => (ledgerBusy = false));
+  }
+
+  // 今天 / 本周（自然周，周一开始）/ 本月：开始那天，以及到今天为止有几天
+  function periodStart(period, now) {
+    const d = new Date(now);
+    const days = period === 'week' ? ((d.getDay() + 6) % 7) + 1 : period === 'month' ? d.getDate() : 1;
+    return { from: dayKey(new Date(d.getFullYear(), d.getMonth(), d.getDate() - days + 1).getTime()), days };
+  }
+
+  const LEDGER_FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite', 'cost', 'turns'];
+
+  // 一段时间的合计、按模型拆开（modelName 相同的合并），以及近 30 天每天的费用
+  function usageSummary(period = 'day') {
+    const now = Date.now();
+    const { from, days } = periodStart(period, now);
+    const to = dayKey(now);
+    const sum = () => Object.fromEntries(LEDGER_FIELDS.map((f) => [f, 0]));
+    const s = { period, from, to, days, ...sum(), models: [], daily: [] };
+    const models = {};
+    for (const day in ledger.days) {
+      if (day < from || day > to) continue;
+      for (const id in ledger.days[day]) {
+        const e = ledger.days[day][id] || [];
+        const name = modelName(id) || id || '未知模型';
+        const m = (models[name] ||= { name, ...sum() });
+        LEDGER_FIELDS.forEach((f, i) => {
+          s[f] += num(e[i]);
+          m[f] += num(e[i]);
+        });
+      }
+    }
+    s.models = Object.values(models).sort((a, b) => b.cost - a.cost || b.output - a.output);
+    const d = new Date(now);
+    for (let i = 29; i >= 0; i--) {
+      const day = dayKey(new Date(d.getFullYear(), d.getMonth(), d.getDate() - i).getTime());
+      let cost = 0;
+      let turns = 0;
+      for (const id in ledger.days[day] || {}) {
+        cost += num(ledger.days[day][id][4]);
+        turns += num(ledger.days[day][id][5]);
+      }
+      s.daily.push({ day, cost, turns, inPeriod: day >= from });
+    }
+    return s;
+  }
+
+  // 一行是“日期 + 模型”，模型写原始 id
+  function ledgerCsv() {
+    const cell = (v) => (/[",\n]/.test(String(v)) ? '"' + String(v).replace(/"/g, '""') + '"' : String(v));
+    const rows = [['date', 'model', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'cost_usd', 'turns']];
+    for (const day of Object.keys(ledger.days).sort()) {
+      for (const id of Object.keys(ledger.days[day]).sort()) {
+        const e = ledger.days[day][id] || [];
+        rows.push([day, id || 'unknown', num(e[0]), num(e[1]), num(e[2]), num(e[3]), +num(e[4]).toFixed(6), num(e[5])]);
+      }
+    }
+    return rows.map((r) => r.map(cell).join(',')).join('\n') + '\n';
+  }
+
+  function ledgerStats() {
+    const days = Object.keys(ledger.days).sort();
+    return {
+      days: days.length,
+      first: days[0] || null,
+      sessions: Object.keys(ledger.sessions).length,
+      thisSession: !!ledger.sessions[state.path],
+      at: ledger.at ? new Date(ledger.at).toISOString() : null,
+      bytes: (lsGet(LEDGER_KEY) || '').length,
+    };
+  }
+
   // ---------------------------------------------------------------- 网络挂钩
 
   const TAP_TYPES = /json|event-stream|ndjson|text\/plain/i;
@@ -1739,6 +1926,7 @@
       usageHist: Object.fromEntries(Object.entries(usageHist).map(([k, x]) => [k, x.pts.length])),
       extraUsage,
       quota: quotaRates(),
+      ledger: ledgerStats(),
       poll: { on: pollOn, fails: pollFails, error: pollErr, org: !!currentOrg(), at: pollAt ? new Date(pollAt).toISOString() : null },
       counts: {
         messages: state.messages.size,
@@ -1939,7 +2127,18 @@
     .link { border: 0; background: transparent; color: inherit; font: inherit; padding: 2px 6px; border-radius: 5px; cursor: pointer; }
     .link:hover { background: var(--control); color: var(--ink); }
     .link.on { color: var(--accent); }
-    .ver { margin-left: auto; padding-right: 6px; }
+    .ver { margin-left: auto; padding-right: 6px; min-width: 0; overflow: hidden; white-space: nowrap; }
+    .foot .link { flex: none; white-space: nowrap; }
+    .tabs { display: flex; gap: 2px; padding: 2px; margin-bottom: 8px; border-radius: 7px; background: var(--control); }
+    .tab { flex: 1; border: 0; background: transparent; color: var(--ink2); font: inherit; line-height: 18px; padding: 1px 0;
+      border-radius: 5px; cursor: pointer; }
+    .tab:hover { color: var(--ink); }
+    .tab.on { background: var(--surface); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,0.12); }
+    .bars { display: block; width: 100%; height: 40px; margin-top: 6px; border-radius: 2px; }
+    .bars:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .mrows .row + .row { margin-top: 1px; }
+    .note { display: flex; align-items: center; gap: 4px; margin: 8px -6px 0 0; color: var(--muted); font-size: 11px; }
+    .note > span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   `;
 
   function h(tag, cls, text) {
@@ -2014,6 +2213,8 @@
 
   const ui = { limitRows: {} };
   let mode = lsGet('ctm-mode') === 'full' ? 'full' : 'compact';
+  let view = 'live'; // 完整面板显示本会话（live）还是用量汇总（summary）
+  let period = 'day';
   let pos = { h: 'right', x: 16, v: 'bottom', y: 16 }; // 贴着哪个角、离两边多远
   try {
     const p = JSON.parse(lsGet('ctm-anchor') || 'null');
@@ -2085,6 +2286,33 @@
     applyPos();
     keepInView();
     if (m === 'full') pollUsage(true);
+  }
+
+  function setView(v) {
+    view = v;
+    ui.body.style.display = v === 'live' ? '' : 'none';
+    ui.sumBody.style.display = v === 'summary' ? '' : 'none';
+    ui.viewBtn.textContent = v === 'summary' ? '返回' : '汇总';
+    ui.viewBtn.title = v === 'summary' ? '回到本会话的实时统计' : '按天 / 周 / 月汇总用量和等价费用';
+    sumKey = '';
+    paint(true);
+    keepInView();
+  }
+
+  function downloadCsv() {
+    try {
+      const a = h('a');
+      a.href = URL.createObjectURL(new Blob([ledgerCsv()], { type: 'text/csv' }));
+      a.download = 'claude-usage-' + dayKey(Date.now()) + '.csv';
+      ui.root.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    } catch (e) {
+      console.log(ledgerCsv());
+      ui.csvBtn.textContent = '导出失败，已打印到控制台';
+      setTimeout(() => (ui.csvBtn.textContent = '导出 CSV'), 1600);
+    }
   }
 
   function copyDiagnostics() {
@@ -2203,6 +2431,8 @@
     body.append(grid);
     ui.models = h('div', 'models');
     body.append(ui.models);
+    ui.body = body;
+    buildSummary();
 
     // 底栏：调试和设置
     const foot = h('div', 'foot');
@@ -2226,18 +2456,105 @@
       if (pollOn) pollUsage(true);
       dirty = true;
     });
-    foot.append(ui.copyBtn, ui.debugBtn, ui.pollBtn, h('span', 'ver', 'v' + VERSION));
+    ui.viewBtn = link('汇总', '', () => setView(view === 'summary' ? 'live' : 'summary'));
+    foot.append(ui.viewBtn, ui.copyBtn, ui.debugBtn, ui.pollBtn, h('span', 'ver', 'v' + VERSION));
 
-    full.append(head, body, foot);
+    full.append(head, body, ui.sumBody, foot);
     root.append(pill, full);
     shadow.append(root);
     document.body.append(host);
     applyTheme(pageIsDark() ? 'dark' : 'light');
+    setView(view);
     setMode(mode);
     W.addEventListener('resize', () => {
       applyPos();
       keepInView();
     });
+  }
+
+  const PERIODS = { day: '今天', week: '本周', month: '本月' };
+  const LEDGER_TIP =
+    '只统计这个浏览器看到的：在这里打开过的 Claude Code 网页会话（打开一个旧会话，它的历史会补记到对应日期）。\n' +
+    '没在这里打开过的会话、终端里的 CLI、普通 claude.ai 聊天（那边没有 token 数据）都算不到。\n' +
+    '历史只加载了一部分时，较早的花费可能会合并记在看到的第一轮那天。\n' +
+    '费用按 API 标价折算，订阅用户并不按这个付费。';
+
+  // 用量汇总：今天 / 本周 / 本月一次显示一栏
+  function buildSummary() {
+    const body = (ui.sumBody = h('div', 'body'));
+    const tabs = h('div', 'tabs');
+    tabs.setAttribute('role', 'tablist');
+    ui.tabs = {};
+    for (const p in PERIODS) {
+      const b = (ui.tabs[p] = h('button', 'tab', PERIODS[p]));
+      b.type = 'button';
+      b.setAttribute('role', 'tab');
+      b.addEventListener('click', () => {
+        period = p;
+        sumKey = '';
+        paint(true);
+      });
+      tabs.append(b);
+    }
+    const hero = h('div', 'hero');
+    ui.sumBig = h('span', 'big', '–');
+    ui.sumBig.title = '按 API 标价折算的等价费用：已结束的轮次，含子代理。订阅用户并不按这个付费';
+    ui.sumState = h('span', 'state', 'API 等价费用');
+    hero.append(ui.sumBig, ui.sumState);
+    ui.sumCap = h('div', 'cap');
+    ui.bars = h('canvas', 'bars');
+    ui.bars.tabIndex = 0;
+    ui.bars.setAttribute('role', 'img');
+    ui.bars.setAttribute('aria-label', '近 30 天每天的费用，左右方向键逐天查看');
+    ui.barCap = h('div', 'cap');
+    body.append(tabs, hero, ui.sumCap, ui.bars, ui.barCap, h('div', 'rule'));
+
+    // 柱子所在的整列都是悬停范围；键盘聚焦后用左右方向键逐天看
+    const pick = (i) => {
+      barAt = i;
+      drawBars();
+    };
+    ui.bars.addEventListener('pointermove', (e) => {
+      const r = ui.bars.getBoundingClientRect();
+      pick(Math.max(0, Math.min(29, Math.floor(((e.clientX - r.left) / r.width) * 30))));
+    });
+    ui.bars.addEventListener('pointerleave', () => pick(-1));
+    ui.bars.addEventListener('focus', () => pick(29));
+    ui.bars.addEventListener('blur', () => pick(-1));
+    ui.bars.addEventListener('keydown', (e) => {
+      const d = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0;
+      if (!d) return;
+      e.preventDefault();
+      pick(Math.max(0, Math.min(29, (barAt < 0 ? 29 : barAt) + d)));
+    });
+
+    const grid = h('div', 'grid');
+    const cell = (label, tip, second) => {
+      const k = h('span', second ? 'k second' : 'k', label);
+      const v = h('span', 'v', '–');
+      k.title = v.title = tip;
+      grid.append(k, v);
+      return v;
+    };
+    ui.sum = {
+      output: cell('输出', '含思考 token'),
+      input: cell('输入', '未命中缓存的输入 token', true),
+      cacheRead: cell('缓存读', '从提示缓存读取的输入 token'),
+      cacheWrite: cell('缓存写', '写入提示缓存的输入 token', true),
+    };
+    ui.mrows = h('div', 'mrows');
+    body.append(grid, h('div', 'rule'), ui.mrows);
+
+    const note = h('div', 'note');
+    const text = h('span', null, '只统计在这个浏览器打开过的会话');
+    text.title = LEDGER_TIP;
+    ui.csvBtn = h('button', 'link', '导出 CSV');
+    ui.csvBtn.type = 'button';
+    ui.csvBtn.title = '下载 CSV：每天每个模型一行（输入、输出、缓存读、缓存写、美元、轮数），保留本月和之前 12 个月';
+    ui.csvBtn.addEventListener('click', downloadCsv);
+    note.append(text, ui.csvBtn);
+    body.append(note);
+    body.style.display = 'none';
   }
 
   function limitRow(l) {
@@ -2311,6 +2628,88 @@
     g.fillText(Math.round(max) + ' tok/s', 0, 9);
   }
 
+  // 近 30 天每天的费用：本栏（今天 / 本周 / 本月）里的几天用强调色，其余用同一色调的浅色
+  let sumData = null;
+  let barAt = -1; // 悬停或键盘选中的那天
+  function drawBars() {
+    const c = ui.bars;
+    const s = sumData;
+    if (!s) return;
+    const dpr = W.devicePixelRatio || 1;
+    const w = c.clientWidth;
+    const hh = c.clientHeight;
+    if (!w) return;
+    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(hh * dpr)) {
+      c.width = Math.round(w * dpr);
+      c.height = Math.round(hh * dpr);
+    }
+    const g = c.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, hh);
+    const data = s.daily;
+    const max = Math.max(0, ...data.map((d) => d.cost));
+    const slot = w / data.length;
+    const bw = Math.min(24, slot - 2); // 相邻两根之间留 2px
+    const top = 12; // 顶上留给刻度文字
+    if (barAt >= 0) {
+      g.fillStyle = theme.control;
+      g.fillRect(barAt * slot, top - 2, slot, hh - top + 2);
+    }
+    data.forEach((d, i) => {
+      if (!d.cost) return;
+      const bh = Math.max(1, (d.cost / max) * (hh - top - 1));
+      const x = i * slot + (slot - bw) / 2;
+      g.fillStyle = d.inPeriod || i === barAt ? theme.accent : tint(theme.accent, themeName === 'dark' ? 0.4 : 0.32);
+      g.beginPath();
+      if (g.roundRect) g.roundRect(x, hh - 1 - bh, bw, bh, [Math.min(2, bw / 2), Math.min(2, bw / 2), 0, 0]);
+      else g.rect(x, hh - 1 - bh, bw, bh);
+      g.fill();
+    });
+    g.fillStyle = theme.hair;
+    g.fillRect(0, hh - 1, w, 1);
+    g.fillStyle = theme.muted;
+    g.font = '10px system-ui, sans-serif';
+    g.fillText(max ? fmtCost(max, true) : '近 30 天没有记录', 0, 9);
+    const d = data[barAt];
+    if (d) ui.barCap.textContent = fmtDay(d.day, true) + ' · ' + (d.cost ? fmtCost(d.cost) + ' · ' + d.turns + ' 轮' : '没有记录');
+    else ui.barCap.textContent = max ? '近 30 天共 ' + fmtCost(data.reduce((a, x) => a + x.cost, 0), true) + ' · 悬停查看每天' : '';
+  }
+
+  const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+  // '2026-10-20' → 10/20（周二）
+  function fmtDay(key, weekday) {
+    const [y, m, d] = key.split('-').map(Number);
+    return m + '/' + d + (weekday ? ' ' + WEEKDAYS[new Date(y, m - 1, d).getDay()] : '');
+  }
+
+  let sumKey = '';
+  function paintSummary() {
+    const s = (sumData = usageSummary(period));
+    drawBars();
+    const key = JSON.stringify([s, themeName]);
+    if (key === sumKey) return;
+    sumKey = key;
+    for (const p in ui.tabs) {
+      ui.tabs[p].classList.toggle('on', p === period);
+      ui.tabs[p].setAttribute('aria-selected', String(p === period));
+    }
+    ui.sumBig.textContent = s.cost ? fmtCost(s.cost) : '$0';
+    ui.sumBig.classList.toggle('dim', !s.cost);
+    const range = s.from === s.to ? fmtDay(s.to, true) : fmtDay(s.from) + ' – ' + fmtDay(s.to);
+    ui.sumCap.textContent = range + ' · ' + s.turns + ' 轮' + (s.days > 1 && s.cost ? ' · 日均 ' + fmtCost(s.cost / s.days, true) : '');
+    ui.sumCap.title = s.days > 1 ? `${PERIODS[period]}从 ${fmtDay(s.from, true)} 开始，到今天共 ${s.days} 天` : '';
+    for (const k in ui.sum) ui.sum[k].textContent = fmt(s[k]);
+    ui.mrows.textContent = '';
+    for (const m of s.models) {
+      const { row, value } = addRow(ui.mrows, m.name, '');
+      value.textContent = fmtCost(m.cost, true) + ' · 输出 ' + fmt(m.output);
+      row.title =
+        `${m.name}：${fmtCost(m.cost)}，${m.turns} 轮以它为主（子代理、压缩等用到的模型也算在这一轮里）\n` +
+        `输出 ${m.output.toLocaleString()} · 输入 ${m.input.toLocaleString()} · 缓存读 ${m.cacheRead.toLocaleString()} · 缓存写 ${m.cacheWrite.toLocaleString()}`;
+    }
+    if (!s.models.length) ui.mrows.append(h('div', 'muted', Object.keys(ledger.days).length ? '这段时间没有记录' : '还没有记录：打开一个 Claude Code 会话后开始统计'));
+  }
+
   let live = { active: null, flowing: false, thinking: false, speed: 0 };
   let tick = 0;
   let paintedAt = 0;
@@ -2330,6 +2729,7 @@
     state.spark.push(live.speed);
     if (state.spark.length > SPARK_POINTS) state.spark.shift();
     if (live.speed > state.peak) state.peak = live.speed;
+    if (state.results.length && (!ledgerSeen || ledgerSeen.state !== state || ledgerSeen.rev !== state.rev)) updateLedger();
     if (!ui.root) return;
     if (!ui.host.isConnected && document.body) document.body.append(ui.host); // 页面重建 body 内容时放回去
     if (tick++ % 4 === 0) applyTheme(pageIsDark() ? 'dark' : 'light');
@@ -2350,14 +2750,19 @@
       d.style.opacity = active && !flowing && tick % 2 ? '0.35' : '1';
       d.title = dotTitle;
     }
-    if (mode === 'full') drawSpark();
+    if (mode === 'full' && view === 'live') drawSpark();
     // 额度重置这类随时间变化的内容，至少 15 秒刷新一次
     if (!force && !dirty && !active && now - paintedAt < 15000) return;
     dirty = false;
     paintedAt = now;
     const v = { ...live, turn: lastTurn(), c: contextNow(), lims: limitViews(), t: sessionTotals(), mi: modelInfo(), cache: cacheState() };
     if (mode === 'compact') paintCompact(v);
-    else paintFull(v);
+    else {
+      paintHeader(v.mi);
+      if (view === 'summary') paintSummary();
+      else paintFull(v);
+      paintFoot();
+    }
   }
 
   function paintCompact(v) {
@@ -2592,8 +2997,7 @@
   }
 
   function paintFull(v) {
-    const { c, lims, t, mi } = v;
-    paintHeader(mi);
+    const { c, lims, t } = v;
     paintHero(v);
 
     const frac = c && c.max ? c.used / c.max : 0;
@@ -2619,7 +3023,9 @@
     ui.models.textContent = models.length > 1 ? models.map(([name, x]) => name + ' ' + fmtCost(x.cost, true)).join(' · ') : '';
     ui.models.title = models.length > 1 ? '各模型的累计费用（子代理、压缩等也会用到其他模型）' : '';
     ui.models.style.display = ui.models.textContent ? '' : 'none';
+  }
 
+  function paintFoot() {
     ui.debugBtn.classList.toggle('on', debug);
     ui.debugBtn.textContent = debug ? '调试：开' : '调试';
     ui.pollBtn.classList.toggle('on', pollOn && pollFails < 3);
@@ -2657,6 +3063,11 @@
     model: modelInfo,
     lastTurn,
     quota: () => ({ session: sessionQuotaRates(), combined: quotaRates() }),
+    get ledger() {
+      return ledger; // 按天的用量账本（多个标签页共用）
+    },
+    usage: usageSummary, // __ctm.usage('day' | 'week' | 'month')
+    usageCsv: ledgerCsv,
     diagnostics,
     pollUsage: () => pollUsage(true),
     mode: (m) => setMode(m === 'full' ? 'full' : 'compact'),

@@ -6,10 +6,11 @@ const path = require('path');
 // CTM_SCRIPT 可以指向别的版本（比如 git show 出来的旧版），看用例在旧版上是否失败
 const SRC = fs.readFileSync(process.env.CTM_SCRIPT || path.join(__dirname, '..', 'claude-token-meter.user.js'), 'utf8');
 
-// opts.now：起始时间（毫秒）；opts.storage：预置的 localStorage；opts.path：页面路径（会话）
+// opts.now：起始时间（毫秒）；opts.storage：预置的 localStorage，对象会拷贝一份，传 Map 则直接共用
+// （模拟同一个浏览器里的两个标签页）；opts.path：页面路径（会话）；opts.locks：navigator.locks 的替身，默认没有
 function load(opts = {}) {
   const clock = { now: opts.now || Date.parse('2026-10-20T02:00:00Z'), perf: 1000 };
-  const store = new Map(Object.entries(opts.storage || {}));
+  const store = opts.storage instanceof Map ? opts.storage : new Map(Object.entries(opts.storage || {}));
   const localStorage = {
     getItem: (k) => (store.has(k) ? store.get(k) : null),
     setItem: (k, v) => void store.set(k, String(v)),
@@ -26,19 +27,23 @@ function load(opts = {}) {
   };
   const location = { pathname: opts.path || '/code/session_0123456789abcdefghij' };
   const history = { pushState() {}, replaceState() {} };
+  const navigator = opts.locks ? { locks: opts.locks } : {};
   const performance = { now: () => clock.perf };
   const FakeDate = class extends Date {
+    constructor(...a) {
+      super(...(a.length ? a : [clock.now]));
+    }
     static now() {
       return clock.now;
     }
   };
   const ticks = [];
   const run = new Function(
-    'window', 'localStorage', 'document', 'location', 'history', 'performance',
+    'window', 'localStorage', 'document', 'location', 'history', 'navigator', 'performance',
     'setInterval', 'setTimeout', 'requestAnimationFrame', 'Date',
     SRC
   );
-  run(window, localStorage, document, location, history, performance, (f) => ticks.push(f), () => 0, () => 0, FakeDate);
+  run(window, localStorage, document, location, history, navigator, performance, (f) => ticks.push(f), () => 0, () => 0, FakeDate);
   const ctm = window.__ctm;
   return {
     ctm,
