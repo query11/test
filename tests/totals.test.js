@@ -63,6 +63,32 @@ test('还没结束的这一轮：按事件累加并标成估算值', () => {
   assert.ok(t.cost > 1);
 });
 
+test('↺ 从现在开始计：下一轮只算这一轮，不会跳回整个会话的累计值；再点一下恢复', () => {
+  const h = load();
+  h.feed(assistant('m1', { cacheRead: 1000 }), result({ [OPUS]: { output: 10000, cost: 10 } }, { apiMs: 100000, wallMs: 120000 }));
+  h.feed(assistant('m2', { cacheRead: 2000 }), result({ [OPUS]: { output: 12000, cost: 12 } }, { apiMs: 120000, wallMs: 30000 }));
+  h.ctm.trip();
+  let t = h.ctm.totals();
+  assert.equal(t.cost, 0);
+  assert.equal(t.output, 0);
+  assert.equal(t.requests, 0);
+  assert.ok(t.since > 0);
+  h.feed(assistant('m3', { cacheRead: 3000 }), result({ [OPUS]: { output: 13000, cost: 13 } }, { apiMs: 140000, wallMs: 25000 }));
+  t = h.ctm.totals();
+  assert.ok(Math.abs(t.cost - 1) < 1e-9, 'cost ' + t.cost);
+  assert.equal(t.output, 1000);
+  assert.equal(t.requests, 1);
+  assert.deepEqual(Object.keys(t.models), ['Opus 5.5']);
+  assert.equal(h.ctm.lastTurn().tokens, 1000); // 上一轮照常
+  h.render();
+  assert.equal(h.ctm.usage('day').cost, 13); // 用量汇总不受影响
+  h.ctm.trip();
+  t = h.ctm.totals();
+  assert.equal(t.cost, 13);
+  assert.equal(t.requests, 3);
+  assert.equal(t.since, 0);
+});
+
 test('对话内容里看起来像事件的 JSON（比如读到的日志文件）不计入', () => {
   const h = load();
   h.feed(result({ [OPUS]: { output: 1000, cost: 1 } }));

@@ -1,12 +1,13 @@
 # 交接文档
 
-写于 2026-10-20，同一天做完 1.6.0、1.6.1、1.6.2 后更新。接手时先读这份，做完一项就更新这里（全部做完可以删掉）。
+写于 2026-10-20，同一天做完 1.6.0、1.6.1、1.6.2、1.6.3 后更新。接手时先读这份，做完一项就更新这里（全部做完可以删掉）。
 
 ## 现状
 
-- 仓库有一个油猴脚本 `claude-token-meter.user.js`（单文件，约 3140 行）、`README.md`、截图 `shot.png`、`tests/`，以及 CI 配置 `.github/workflows/test.yml`（push / PR 时跑 `node --test`）。
+- 仓库有一个油猴脚本 `claude-token-meter.user.js`（单文件，约 3290 行）、`README.md`、截图 `shot.png`、`tests/`，以及 CI 配置 `.github/workflows/test.yml`（push / PR 时跑 `node --test`）。
 - 默认分支是 `claude/clever-mendel-97x9jy`。README 里的安装链接和 Tampermonkey 的自动更新都指向默认分支（`@updateURL` 用的是 `HEAD`），合并进去用户才会收到新版本。合并后 raw.githubusercontent.com 的 `HEAD` 链接要过几分钟才变（实测约 3 分钟），按分支名的链接马上就是新的。
-- 1.5.1、1.6.0、1.6.1、1.6.2 都已经快进合并进默认分支（2026-10-20），之后的工作从默认分支开始。
+- 1.5.1、1.6.0、1.6.1、1.6.2 都已经快进合并进默认分支（2026-10-20）。
+- 1.6.3 在分支 `claude/blissful-franklin-1v5cmk` 上（基于默认分支），**还没合并**：合并进默认分支（用户才收到）之前先问用户。
 
 ### 1.5.1 做了什么
 
@@ -62,7 +63,7 @@
 - `onNav` 加了 `log('navigate', …)`，打开“调试”后可以和 fetch / websocket 的日志对照，看历史是在切换会话之前还是之后加载的。
 - `diagnostics().ledger` 多了 `turns`（记过账的轮数）。
 
-账本格式（`ctm-ledger-v2`）：
+账本格式（`ctm-ledger-v2`，1.6.3 起 `sessions` 的键多了 `sid:<CLI 会话 id>`，见下一节）：
 
 ```json
 {
@@ -70,41 +71,76 @@
   "at": 1792461600000,
   "days": { "2026-10-20": { "claude-opus-5-5": [输入, 输出, 缓存读, 缓存写, 美元, 轮数] } },
   "ids": { "2026-10-20": "c1cf2d44-xxx 9e2e7d34-xxx" },
-  "sessions": { "/code/session_…": { "id": "<uuid 前 12 位>", "t": 1792461600000, "c": { "claude-opus-5-5": [输入, 输出, 缓存读, 缓存写, 美元] } } }
+  "sessions": { "sid:<CLI 会话 id>（没有的用页面地址）": { "id": "<uuid 前 12 位>", "t": 1792461600000, "c": { "claude-opus-5-5": [输入, 输出, 缓存读, 缓存写, 美元] } } }
 }
 ```
 
+### 1.6.3 做了什么：切换会话、账本重复记账、↺
+
+起因是 1.6.2 留下的疑问：从侧栏切换会话时，历史是不是在改地址之前加载的。用户打开“调试”从侧栏切换了一次会话，控制台里的顺序是：先 `fetch /v1/code/sessions/session_…`（会话对象），然后 `navigate`，之后才是 `events?limit=500&sort_order=asc&cursor=116` 和 `events?limit=20&sort_order=desc`。
+
+- **1.6.2 的猜测不对**：历史是在改地址之后加载的，`reset()` 没有清掉它。
+- **真正的原因**：网页对这个标签页里看过的会话有缓存，切回来时只拉 cursor 之后的和最新 20 条。Claude Code 一轮往往有几十条事件，最新 20 条常常连上一轮的 result 都没有。脚本切换会话时清零，切回来就只剩这一点。1.6.2 问题 2（刷新前那个标签页里只有最新一轮）多半就是这个原因。
+
+在测试台里复现出的后果：
+
+1. 面板：/clear 之前的段丢了（$7 → $2），上轮均速也没了，刷新才恢复。
+2. 账本多记：前几轮在别的页面（项目频道页、别的会话地址）记过账，到会话页面又只看到最新一轮时，这个地址下没有水位线，整段累计值又记一遍（应为 $2.50，记成 $4.50）。
+3. 后到的历史比之前实时看到的还新（切回会话、断线重连后补拉的）时，1.6.2 把实时的一律排在历史后面，同一段被拆成两段，面板和账本都重复算。保留状态之后每次切回会话都会遇到，所以一起修了。
+
+真实的 result 长什么样：用 Claude Code 远程会话的事件接口看了这个会话自己的 result，里面有 `session_id`（CLI 会话 id）、`turn_started_wall_ms`、`duration_ms`、`duration_api_ms`、`num_turns`（这一轮的请求数）、`time_origin_ms`（CLI 进程启动时间）、`process_turn_index`、`modelUsage[…].thinkingTokens` 等。
+
+改法：
+
+- **按会话保留状态**（`states`、`stateFor()`）：切换会话不再清零，每个标签页留最近 10 个（`MAX_STATES`），当前的和还有没记账 result 的不挤掉。切走时只收起实时流（lanes、速度曲线），地址换了写法、还是同一个会话（`session_` / `cse_`）时不收。`calib` 改成各会话共用的变量。
+- **按接口地址归到会话**（`routed()`、`sessionOf()`）：地址里有 `session_<id>` / `cse_<id>` 的数据记到那个会话，不看当前在哪个页面；XHR、WebSocket、EventSource 也把地址传进来。`isCurrentSession` 按状态所属的会话判断，所以切换前就拿到的会话信息也算数。
+- **先后顺序**（`stamp` / `isAfter`）：实时记录多了 `pos`，是到达时间，但不早于在它之前到的历史记录。一条实时、一条历史时：历史先到的，实时的在后（和以前一样）；历史后到的，按时间比。
+  - 给 result 排序时，两条离得不到 2 分钟（`SKEW_MS`，本机时钟可能不准）就按累计值排（`closeCall`）。这条只用在 result 排序里：放进通用的 `isAfter` 的话，一轮进行中刷新页面、历史晚到时，这一轮已经发出的请求会被当成已经结束的（有用例）。
+  - `orderKey` 跟着改成 pos / ts，`byOrder` 让同一毫秒到达的实时记录按到达顺序排。
+- **分段按 CLI 会话分开**（`runs()`）：一个页面里混着几个会话的 result 时（频道页），各自分段。`/clear` 记录也带 `sid`，只切自己会话的段。分段结果缓存在各自的状态上（`runCache`）。
+- **账本水位线按 CLI 会话记**：键是 `sid:<session_id>`，没有会话 id 的仍按页面地址。
+  - 只在这次记了新轮次（或者还没有水位线）时才挪，所以别的标签页里只看到较早几轮的不会把它拉回去（1.6.2 按地址记时也有这个问题）。
+  - 每个留着的会话都记账（`render()` 里遍历 `states`）。
+- **会话信息变了，当成刚到的**（`addInfo`）：会话对象的时间戳是会话创建的时间。切走期间在别处改了推理强度的话，切回来拿到的新值会被切走前的旧线索盖过。
+- **↺ 改成从现在开始计**（`toggleTrip`、`tripBase`、`sessionTotals`）：记下点击的那一刻，各段减去那之前的最后一条；请求数、缓存重建也只算之后的。
+  - 打开时按钮高亮，费用那一行写“15:16 起”，一行摘要里费用前面带 ↺；再点一下恢复。
+  - 控制台的 `__ctm.reset` 换成了 `__ctm.trip`。
+- 诊断里多了 `counts.sessions`（留着状态的会话数）、`counts.cliSessions`、`trip`。
+
+账本没有清空：1.6.2 今天刚清过。问过用户要不要再清，还没回答。
+
 ### 测试
 
-在仓库根目录运行 `node --test`（Node 20 以上，不用装依赖），目前 44 个用例全部通过。CI 在 push / PR 时也跑。
+在仓库根目录运行 `node --test`（Node 20 以上，不用装依赖），目前 58 个用例全部通过。CI 在 push / PR 时也跑。
 
-- `tests/harness.js`：在 Node 里加载脚本，桩掉浏览器对象，时间由测试控制（`advance` / `wait`），不建 UI。`opts.storage` 传 `Map` 时直接共用（模拟同一浏览器的几个标签页），传对象时拷贝一份；`opts.locks` 是 `navigator.locks` 的替身；`opts.fetch` 是页面的 `fetch`（查用量接口也用它），`opts.cookie` 里放 `lastActiveOrg=<组织 id>`；脚本里不带参数的 `new Date()` 也跟着测试的时钟走。`render()` 在建 UI 之前就返回，所以记账、重置后刷新这类放在 UI 检查之前的逻辑会跑，正常的定时轮询、重绘不会跑。
+- `tests/harness.js`：在 Node 里加载脚本，桩掉浏览器对象，时间由测试控制（`advance` / `wait`），不建 UI。`opts.storage` 传 `Map` 时直接共用（模拟同一浏览器的几个标签页），传对象时拷贝一份；`opts.locks` 是 `navigator.locks` 的替身；`opts.fetch` 是页面的 `fetch`（查用量接口也用它），`opts.cookie` 里放 `lastActiveOrg=<组织 id>`；脚本里不带参数的 `new Date()` 也跟着测试的时钟走。返回的 `navigate(path)` 像网页那样切换会话（`history.pushState`），`feedFrom(url, ...)` 喂从某个接口地址来的数据；`result(..., { sid })` 带上 CLI 会话 id。`render()` 在建 UI 之前就返回，所以记账、重置后刷新这类放在 UI 检查之前的逻辑会跑，正常的定时轮询、重绘不会跑。
 - `streaming.test.js`、`forecast.test.js`、`totals.test.js`：实时流、额度预测、累计值。
 - `quota.test.js`：额度合并、每 1% 折合美元（读数回落、闲置、只加载了部分历史时不覆盖）。
 - `poll.test.js`：重置几秒后查一次并换上新窗口；重置后已有新读数不查；返回里没有这个窗口、请求失败时只查一次；关掉额度刷新时不查。
-- `ledger.test.js`（17 个）：刷新和多个标签页不重复记、uuid 对不上、本机时钟偏快、`/clear` 和子代理、只加载部分历史、同一段历史在两个会话地址下、先看到最新一轮后来才加载历史、先看到段中间的一轮、加锁路径、跨午夜、保留期、今天 / 本周 / 本月、CSV 和诊断。
-- `CTM_SCRIPT=<文件> node --test` 可以拿别的版本跑同一组用例。账本的每个保护（1.6.2 的按 uuid 去重、段内被包含、水位线只在不可见时用，以及之前的几条）、重置后刷新的两个条件（读数早于重置、每次重置只查一次）都单独去掉验证过，去掉之后对应用例会失败。
+- `ledger.test.js`（19 个）：刷新和多个标签页不重复记、uuid 对不上、本机时钟偏快、`/clear` 和子代理、只加载部分历史、同一段历史在两个会话地址下、在别的页面记过账后只看到最新一轮、水位线只往后挪、先看到最新一轮后来才加载历史、先看到段中间的一轮、加锁路径、跨午夜、保留期、今天 / 本周 / 本月、CSV 和诊断。
+- `sessions.test.js`（11 个）：切回来只补拉最新的事件、切换之后才到的上一个会话的数据、频道页上加载的会话历史、切换前拿到的会话信息、切走时进行中的请求、切走期间改了推理强度、后到的历史比实时的还新、本机时钟快时离得近的几轮、一轮进行中刷新页面而历史晚到、几个 CLI 会话混在一个页面里、最多留 10 个会话。`totals.test.js` 里有 ↺ 的用例。
+- `CTM_SCRIPT=<文件> node --test` 可以拿别的版本跑同一组用例。账本的每个保护（1.6.2 的按 uuid 去重、段内被包含、水位线只在不可见时用，以及之前的几条）、重置后刷新的两个条件（读数早于重置、每次重置只查一次）都单独去掉验证过，去掉之后对应用例会失败。1.6.3 的每一处也一样（按地址归到会话、保留状态、后到的历史按时间比、离得近的按累计值排、分段按 CLI 会话分开、水位线按 CLI 会话记、只往后挪、当前会话不被挤掉、每个会话都记账、↺、切走时收起实时流、换成同一会话的另一种地址写法时不收、会话信息变了当成刚到的）；1.6.2 上 11 个新用例失败。
 - 事件是照着脚本解析的格式手工构造的，**不是录下来的真实数据**。
-- 界面没有自动化测试，是用 Playwright 手动看的：`page.route('https://claude.ai/**', …)` 返回一个空页面，`page.addInitScript` 先往 localStorage 里放假数据再注入脚本，`__ctm.ingest` 喂几条 result，点按钮后截图。容器里有 Chromium（`/opt/pw-browsers`）和全局的 `playwright` 包（`NODE_PATH=$(npm root -g)`）。后台标签页不重绘这一条没有测（Playwright 不好模拟页面隐藏）。
+- 界面没有自动化测试，是用 Playwright 手动看的：`page.route('https://claude.ai/**', …)` 返回一个空页面，`page.addInitScript` 先往 localStorage 里放假数据再注入脚本，`__ctm.ingest` 喂几条 result，点按钮后截图。容器里有 Chromium（`/opt/pw-browsers`）和全局的 `playwright` 包（`NODE_PATH=$(npm root -g)`）。后台标签页不重绘这一条没有测（Playwright 不好模拟页面隐藏）。1.6.3 的 ↺（按钮高亮、“15:16 起”、一行摘要的 ↺）和 `history.pushState` 切换会话再切回来，也是这样在 Chromium 里看过的。
 
-## 代码地图（行号以 1.6.2 为准）
+## 代码地图（行号以 1.6.3 为准）
 
 | 位置（`claude-token-meter.user.js`） | 内容 |
 | --- | --- |
-| `:74` state | `freshState()`：每个会话的内存状态（`path` 是它属于哪个会话）；切换会话时 `reset()` 清零 |
-| `:110` 先后顺序 | `stamp` / `isAfter` / `compare`：实时事件按到达顺序，历史记录按时间戳 |
-| `:202` `recordResult` | `result` 事件 → `state.results`（uuid、各模型累计值、`total_cost_usd`、`duration_api_ms`） |
-| `:266` 实时流 | 每一路（主对话 `main`、子代理按 `parent_tool_use_id`）的速度统计，`closeLane` |
-| `:420` 订阅额度 | `mergeLimit`（同一窗口取最大值）、`notePoint`（读数历史）、`forecast`（预测用完时间）、`recordOfficial`（用量接口） |
-| `:677` 事件识别 | `handle()` 按事件类型分发；`walk()` 遍历 JSON，跳过对话内容（`CONTENT_TYPES`） |
-| `:1023` 统计 | `runs()` 按 `/clear` 分段，`sessionTotals()`、`lastTurn()`、`contextNow()` |
-| `:1144` 提示缓存 | 价目表 `CACHE_PRICES`、`cacheState()`（过期时间、重建次数和原因） |
-| `:1252` 额度折合多少钱 | `sessionQuotaRates()`：每轮花费按 result 差值分摊到请求，再和额度跳变对齐；`quotaRates()` 按会话存进 `ctm-rates-v4` 再合并 |
-| `:1513` 用量账本 | `updateLedger()`（`:1601`，按 uuid 去重、加锁）、`addTurn`、`pruneLedger`、`usageSummary()`、`ledgerCsv()`、`ledgerStats()` |
-| `:1728` 网络挂钩 | fetch / XHR / WebSocket / EventSource，切换会话时 `reset()`（`onNav`） |
-| `:1882` 主动刷新额度 | `pollUsage()`：每 3 分钟查一次用量接口，多标签页共用；`pollAfterReset()`（`:1937`） |
-| `:1997` UI | shadow DOM 面板；`buildSummary()`（`:2538`）、`drawBars()` / `paintSummary()`（`:2741`）；`render()`（`:2774`）每 500ms 一次，`paint()` → `paintCompact` / `paintFull` / `paintSummary`，再 `paintFoot` |
-| `:3110` `W.__ctm` | 控制台接口，测试也通过它 |
+| `:74` state | `freshState(path)`：每个会话的内存状态；`stateFor()`（`:118`）按会话 id 取，切换会话时换过去、不清零，最多留 `MAX_STATES` 个；`routed()`（`:135`）按接口地址把数据归到会话；`toggleTrip()`（`:149`）是 ↺ |
+| `:154` 先后顺序 | `stamp`（实时记录带 `pos`）/ `isAfter`（`:171`）/ `compare`；`closeCall`（`:183`）是 result 排序时离得太近、按累计值排的情况 |
+| `:269` `recordResult` | `result` 事件 → `state.results`（uuid、CLI 会话 id `sid`、各模型累计值、`total_cost_usd`、`duration_api_ms`）；`sortResults()`（`:330`） |
+| `:336` 实时流 | 每一路（主对话 `main`、子代理按 `parent_tool_use_id`）的速度统计，`closeLane` |
+| `:493` 订阅额度 | `mergeLimit`（同一窗口取最大值）、`notePoint`（读数历史）、`forecast`（预测用完时间）、`recordOfficial`（用量接口） |
+| `:750` 事件识别 | `handle()` 按事件类型分发；`walk()` 遍历 JSON，跳过对话内容（`CONTENT_TYPES`）；`ingestObj()`（`:1024`）按来源地址归到会话 |
+| `:1100` 统计 | `runs()` 按 CLI 会话和 `/clear` 分段，`tripBase()`（↺）、`sessionTotals()`、`lastTurn()`、`contextNow()` |
+| `:1244` 提示缓存 | 价目表 `CACHE_PRICES`、`cacheState()`（过期时间、重建次数和原因） |
+| `:1354` 额度折合多少钱 | `sessionQuotaRates()`：每轮花费按 result 差值分摊到请求，再和额度跳变对齐；`quotaRates()` 按会话存进 `ctm-rates-v4` 再合并 |
+| `:1616` 用量账本 | `updateLedger(st)`（`:1704`，按 uuid 去重、按 CLI 会话记水位线、加锁）、`addTurn`、`pruneLedger`、`usageSummary()`、`ledgerCsv()`、`ledgerStats()` |
+| `:1839` 网络挂钩 | fetch / XHR / WebSocket / EventSource（都把地址传给 ingest），切换会话时换状态（`onNav`，`:1979`） |
+| `:2005` 主动刷新额度 | `pollUsage()`：每 3 分钟查一次用量接口，多标签页共用；`pollAfterReset()`（`:2060`） |
+| `:2123` UI | shadow DOM 面板；`buildSummary()`（`:2668`）、`drawBars()` / `paintSummary()`（`:2819`）；`render()`（`:2904`）每 500ms 一次，给每个会话记账，`paint()` → `paintCompact` / `paintFull` / `paintSummary`，再 `paintFoot`；`paintTrip()`（`:3037`） |
+| `:3260` `W.__ctm` | 控制台接口，测试也通过它 |
 
 localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-hist`、`ctm-rates-v4`、`ctm-ledger-v2`（旧的 `ctm-ledger` 加载时删掉）、`ctm-poll`、`ctm-poll-at`、`ctm-mode`、`ctm-anchor`、`ctm-debug`。汇总视图选的是哪一栏、是否在汇总视图，只存在内存里。
 
@@ -114,14 +150,17 @@ localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-his
 
 ### 1. 用真实数据核对（需要用户配合）
 
-已经核对过的见“1.6.2 做了什么”。还没核对的：
+已经核对过的见“1.6.2 做了什么”和“1.6.3 做了什么”（侧栏切换会话时的加载顺序）。还没核对的：
 
-- 两个问题的成因：两个会话为什么有同一段历史（复制 / 分叉？）；从侧栏切换会话时历史是不是在改地址之前加载的（打开“调试”，切换会话，看 `navigate` 和 fetch / websocket 日志的先后）。如果是后者，`reset()` 会把刚读到的历史清掉，面板上的会话累计值在刷新前是错的，要修（比如按响应的 URL 判断数据属于哪个会话，切换后把刚读到的属于新会话的数据重新喂一遍）。
+- 装上 1.6.3 后从侧栏切到别的会话再切回来，面板上的会话费用不再变少。
+- 项目频道页加载会话历史用的是不是 `/v1/code/sessions/<id>/events`（在频道页打开“调试”看 fetch 日志）。是的话已经按地址归到各自的会话；不是的话数据仍记在频道页的状态里：账本靠 CLI 会话 id 不会多记，但切到那个会话时面板可能不完整。
+- 实时事件走哪个通道，地址里有没有会话 id（“调试”里的 `websocket` / `eventsource` 行）。没有的话，切换会话之后才到的实时事件仍记在当前页面上。
+- 两个会话地址下有同一段历史的成因：1.6.2 里，切换会话之后才到的上一个会话的响应会记到新会话头上，可能就是这个原因。1.6.3 按地址归位之后，看看还会不会出现。
 - 同一个会话开两个标签页，一轮结束后“今天”只增加一次；
-- 从 `/code` 新建会话，第一轮只记一次（`diagnostics()` 或账本的 `sessions` 里不该出现 `/code` 这样的非会话地址）；
+- 从 `/code` 新建会话，第一轮只记一次（1.6.3 起账本的 `sessions` 里应该是 `sid:` 开头的键，不该出现 `/code` 这样的非会话地址）；
 - 窗口重置后用量接口多久切到新窗口：如果常常要十几秒以上，`RESET_GRACE_MS` 可以加大，或者允许每次重置查两次。
 
-用户的账本里还有一条记在项目频道页面 `/code/project/chan_…` 下的水位线（10/19），说明频道页面上也能看到 result；按 uuid 去重之后，同一轮在频道页面和会话页面各看到一次也只记一次。
+用户的旧账本里有一条记在项目频道页面 `/code/project/chan_…` 下的水位线（10/19），说明频道页面上也能看到 result。按 uuid 去重之后，同一轮在频道页面和会话页面各看到一次也只记一次；1.6.3 起水位线按 CLI 会话记，在频道页记过账的，到会话页面只看到最新一轮时也接得上。
 
 ### 2. “当前 7 天额度窗口内”的花费（用户说先不做）
 
@@ -129,11 +168,12 @@ localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-his
 
 ### 3. 性能（实测之后决定不再做）
 
-一个 2000 轮（约 8000 次请求、6.8 MB 历史）的合成会话，Node 里实测：一次性加载约 190 ms，之后第一次记账约 13 ms；一次重绘要算的东西空闲时约 0.8 ms、输出时约 1.5 ms（`cacheState()` 约 1 ms，`contextNow()` 约 0.5 ms）；`sessionQuotaRates()` 约 13 ms，展开时每 3 秒一次。正常会话只有这个的零头，都远低于能感觉到的程度。按状态版本号缓存要碰输出时一直在变的状态，风险比收益大。如果哪天用户反馈卡顿，再从 `cacheState()` 每次重新排序主对话请求入手。
+1.6.3 用另一个 2000 轮（8000 次请求、4.5 MB）的合成会话对比过：一次性加载 160 ms（1.6.2 是 146 ms），一次重绘要算的约 2 ms，和 1.6.2 差不多。之前的数字：一个 2000 轮（约 8000 次请求、6.8 MB 历史）的合成会话，Node 里实测：一次性加载约 190 ms，之后第一次记账约 13 ms；一次重绘要算的东西空闲时约 0.8 ms、输出时约 1.5 ms（`cacheState()` 约 1 ms，`contextNow()` 约 0.5 ms）；`sessionQuotaRates()` 约 13 ms，展开时每 3 秒一次。正常会话只有这个的零头，都远低于能感觉到的程度。按状态版本号缓存要碰输出时一直在变的状态，风险比收益大。如果哪天用户反馈卡顿，再从 `cacheState()` 每次重新排序主对话请求入手。
 
 ### 4. 读过代码但没有验证的疑点（动手前先用测试台复现）
 
-- `compare()` 在历史里有的 `result` 带时间戳、有的不带时不满足传递性，`sort` 的结果可能不稳定。同一批历史里至少有两条带时间戳时，`fillBatchTimes` 会把缺的补上，所以只在很少的情况下出现。账本按 uuid 在排好的顺序里找水位线，顺序不稳定时也可能受影响。
+- `compare()` 在历史里有的 `result` 带时间戳、有的不带时不满足传递性，`sort` 的结果可能不稳定。同一批历史里至少有两条带时间戳时，`fillBatchTimes` 会把缺的补上，所以只在很少的情况下出现。账本按 uuid 在排好的顺序里找水位线，顺序不稳定时也可能受影响。1.6.3 的 `closeCall`（result 离得太近时按累计值排）也会让少数情况下的比较不满足传递性。
+- `/clear` 之后 CLI 会话 id 变不变不知道：变的话每段一个 id；不变的话靠累计值变小分段，和以前一样。两种情况测试台里都能对上，没有用真实数据核对过。
 - `sessionQuotaRates()` 把每个额度读数和“这次请求之前”的累计花费配对，前提是 `rate_limit_event` 在这次请求的消息记录建立之后才到。真实事件的先后顺序没有核实过（可以和待办 1 一起看）。
 - `ingestText` 会解析所有命中 `WORTH_PARSING` 的 JSON 响应，包括普通 claude.ai 聊天加载对话。如果哪天在性能分析里显眼，可以按 URL 跳过。
 

@@ -195,6 +195,40 @@ test('同一段历史出现在两个会话地址下（比如复制出来的会�
   assert.equal(today(b).turns, 3);
 });
 
+// 真实的 result 带着 CLI 的会话 id（session_id）
+const sid = (r, s) => ({ ...r, session_id: s });
+
+test('前几轮在别的页面看到并记过账，到会话页面只看到最新一轮（看不到上一条）：按 CLI 会话的水位线相减，不重复记', () => {
+  const store = new Map();
+  const p = load({ now: local(20, 10, 5), storage: store, path: '/code/project/chan_0123456789abcdef' });
+  p.feed(history(at(sid(cum(1), 'cli-1'), local(20, 9)), at(sid(cum(2), 'cli-1'), local(20, 10))));
+  p.render();
+  near(today(p).cost, 2);
+  // 网页切到会话时只补拉最新 20 条，Claude Code 一轮往往比这多，上一条 result 不在里面
+  const s = load({ now: local(20, 11, 5), storage: store });
+  s.feed(history(at(sid(cum(2.5), 'cli-1'), local(20, 11))));
+  s.render();
+  near(today(s).cost, 2.5);
+  assert.equal(today(s).turns, 3);
+});
+
+test('水位线只往后挪：另一个标签页里只加载到较早的几轮，不会把它拉回去', () => {
+  const store = new Map();
+  const rs = [1, 2, 3].map((c, i) => at(sid(cum(c), 'cli-2'), local(20, 9, i * 10)));
+  const a = load({ now: local(20, 10), storage: store });
+  a.feed(history(...rs));
+  a.render();
+  near(today(a).cost, 3);
+  const b = load({ now: local(20, 10, 1), storage: store });
+  b.feed(history(rs[0], rs[1]));
+  b.render();
+  // 之后又一个标签页只看到最新一轮：和第 3 轮相减
+  const c = load({ now: local(20, 11, 5), storage: store });
+  c.feed(history(at(sid(cum(4), 'cli-2'), local(20, 11))));
+  c.render();
+  near(today(c).cost, 4);
+});
+
 test('先看到最新一轮、后来才加载到历史：更早的几段补记到各自的日期，再刷新也不重复', () => {
   const store = new Map();
   const now = local(20, 21, 43);

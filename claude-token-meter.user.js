@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.6.2
+// @version      1.6.3
 // @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示模型、推理强度、token 用量、生成速度、提示缓存与订阅额度
 // @homepageURL  https://github.com/query11/test
 // @downloadURL  https://raw.githubusercontent.com/query11/test/HEAD/claude-token-meter.user.js
@@ -37,7 +37,7 @@
   const W = window;
   if (W.__ctm) return;
 
-  const VERSION = '1.6.2';
+  const VERSION = '1.6.3';
   const FLOW_MS = 1500; // 这么久内收到过 token 视为“正在输出”
   // 流式请求这么久没动静就不再显示为进行中（防止漏掉 message_stop 时一直亮着）。只影响显示：
   // 这一路的统计留着，之后再来增量照常计入，真正结束看 message_stop / 下一个 message_start / result
@@ -73,11 +73,16 @@
 
   // ---------------------------------------------------------------- state
 
-  function freshState() {
+  // 每个会话一份。网页切回一个看过的会话时只补拉最新的事件（cursor 之后的和最新 20 条），更早的用它自己的缓存，
+  // 所以切走时不能清掉，要留着切回来接着用
+  function freshState(path) {
     return {
-      path: location.pathname, // 这份状态属于哪个会话：账本按它记水位线，切换会话时状态会整个换掉
+      path, // 这份状态属于哪个会话（会话页面的地址）：账本按它记没有 CLI 会话 id 的水位线，额度折算按它存
+      since: null, // 点 ↺ 的那一刻：统计只算之后的，见 tripBase()
+      ledgerRev: -1, // 上次记账时的 rev
       seen: new Set(), // 已处理的事件 uuid
       seq: 0, // 到达顺序
+      hmax: 0, // 已经到了的历史记录里最晚的时间戳：之后实时到达的排在它后面
       rev: 0, // result 和 /clear 记录的版本，分段结果按它缓存
       messages: new Map(), // message id -> 见 messageRecord()
       results: [], // result 快照，按先后排序
@@ -91,36 +96,95 @@
       samples: [], // [timestamp, tokens]
       spark: [],
       peak: 0,
-      calib: 1, // 估算 → 精确 token 的校准系数
       anon: 0,
       types: {}, // 各类事件的数量，诊断用
     };
   }
-  let state = freshState();
+
+  // 会话 id：会话页面 /code/session_<id>、接口 /v1/code/sessions/session_<id>/events 和 …/cse_<id>/… 里都有，去掉前缀是同一个
+  const SESSION_IN = /\/(?:session|cse)_([A-Za-z0-9]{10,})(?![A-Za-z0-9])/;
+  const sessionOf = (s) => {
+    const m = typeof s === 'string' && SESSION_IN.exec(s);
+    return m ? m[1] : '';
+  };
+
+  // 会话 id（不是会话页面时是页面地址）-> 状态，最近用过的在后面
+  const MAX_STATES = 10;
+  const states = new Map();
+  let state = null; // 当前页面的
+  let calib = 1; // 估算 → 精确 token 的校准系数，各会话共用
   let dirty = true;
 
-  function reset() {
-    const calib = state.calib;
-    state = freshState();
-    state.calib = calib;
-    quotaCache = null;
+  function stateFor(path) {
+    const sid = sessionOf(path);
+    const key = sid || path;
+    let st = states.get(key);
+    if (st) states.delete(key);
+    else st = freshState(sid ? '/code/session_' + sid : path);
+    states.set(key, st);
+    for (const [k, s] of states) {
+      if (states.size <= MAX_STATES) break;
+      if (s !== st && s !== state && !(s.results.length && s.ledgerRev !== s.rev)) states.delete(k); // 还没记账的先留着
+    }
+    return st;
+  }
+  state = stateFor(location.pathname);
+
+  // 接口地址里带着会话 id 的数据归到那个会话，不看当前在哪个页面：切换会话之后才到的上一个会话的响应、
+  // 项目频道页上加载的会话历史，都记在各自的会话里
+  function routed(src, fn) {
+    const sid = sessionOf(src);
+    if (!sid || sid === sessionOf(state.path)) return fn();
+    const cur = state;
+    state = stateFor('/code/session_' + sid);
+    try {
+      return fn();
+    } finally {
+      state = cur;
+    }
+  }
+
+  // ↺：从现在开始计，再点一下恢复整个会话。result 带的是累计值，清掉状态的话下一轮又会把整个会话带回来，
+  // 所以只记下这一刻，统计时减去这一刻之前的
+  function toggleTrip() {
+    state.since = state.since ? null : stamp({});
     dirty = true;
   }
 
   // ---------------------------------------------------------------- 先后顺序
 
+  const noteHist = (ts) => {
+    if (ts > state.hmax) state.hmax = ts;
+  };
+
   // 每条记录带 live（实时到达而非历史加载）、到达序号 seq 和 ts（事件自带的时间戳，可能没有）。
-  // 实时事件按到达顺序；历史记录常常是倒序加载的，只能看时间戳。
+  // 实时事件按到达顺序；历史记录常常是倒序加载的，只能看时间戳。实时的另有 pos：到达时间，但不早于在它之前到的历史记录
   function stamp(ctx, fallbackTs) {
-    return { ts: ctx.ts || fallbackTs || 0, live: !ctx.bulk, seq: ++state.seq, at: Date.now() };
+    const ts = ctx.ts || fallbackTs || 0;
+    const live = !ctx.bulk;
+    const at = Date.now();
+    if (!live) noteHist(ts);
+    return { ts, live, seq: ++state.seq, at, pos: live ? Math.max(at, state.hmax) : 0 };
   }
 
   // a 是否确定晚于 b；判断不了时返回 false
   function isAfter(a, b) {
     if (a.live && b.live) return a.seq > b.seq;
-    if (a.live !== b.live) return a.live;
-    return !!(a.ts && b.ts) && a.ts > b.ts;
+    if (a.live === b.live) return !!(a.ts && b.ts) && a.ts > b.ts;
+    // 一条实时、一条历史：先到的历史记录都早于之后实时到达的。后到的历史记录（切回会话、断线重连后网页补拉的）可能比之前
+    // 实时看到的还新，按时间比
+    const [l, h] = a.live ? [a, b] : [b, a];
+    const later = h.seq < l.seq || !h.ts || l.pos >= h.ts;
+    return a.live ? later : !later;
   }
+
+  // 本机时钟和服务端可能差这么多：一条实时、一条后到的历史离得这么近时，时间先后靠不住
+  const SKEW_MS = 120000;
+  const closeCall = (a, b) => {
+    if (a.live === b.live) return false;
+    const [l, h] = a.live ? [a, b] : [b, a];
+    return h.seq > l.seq && !!h.ts && Math.abs(l.pos - h.ts) < SKEW_MS;
+  };
 
   // 排序用；先后判断不了时按 weight（累计值、上下文这类一般只增不减的量）
   function compare(a, b, weight) {
@@ -141,7 +205,7 @@
       else if ((c >= 0x3000 && c <= 0x9fff) || (c >= 0xac00 && c <= 0xd7af) || (c >= 0xff00 && c <= 0xffef)) cjk++;
       else other++;
     }
-    return (ascii / 3.8 + cjk * 0.9 + other * 0.5) * state.calib;
+    return (ascii / 3.8 + cjk * 0.9 + other * 0.5) * calib;
   }
 
   const num = (v) => (typeof v === 'number' && isFinite(v) ? v : 0);
@@ -167,7 +231,10 @@
       };
       state.messages.set(id, m);
       if (ctx.batch) ctx.batch.push(m);
-    } else if (!m.ts && ctx.ts) m.ts = ctx.ts;
+    } else if (!m.ts && ctx.ts) {
+      m.ts = ctx.ts;
+      if (!m.live) noteHist(m.ts);
+    }
     return m;
   }
 
@@ -235,6 +302,8 @@
     const r = {
       ...stamp(ctx, end),
       id: typeof o.uuid === 'string' ? o.uuid : '', // 账本按它找上次记到哪一条
+      // CLI 的会话 id：累计值只在同一个 CLI 会话里连续，分段、账本的水位线都按它分开
+      sid: typeof o.session_id === 'string' ? o.session_id : '',
       cost,
       totals: models ? totals : null,
       byModel,
@@ -257,8 +326,9 @@
     if (!ctx.bulk) setTimeout(() => pollUsage(true), 4000); // 额度刚变过，稍后刷新一次
   }
 
+  // 时间先后靠不住时按累计值排（同一段里只增不减）：排错了，同一轮的累计值会被当成新的一段再算一遍
   function sortResults() {
-    state.results.sort((a, b) => compare(a, b, resultWeight));
+    state.results.sort((a, b) => (closeCall(a, b) ? resultWeight(a) - resultWeight(b) : compare(a, b, resultWeight)));
     state.rev++;
     dirty = true;
   }
@@ -300,12 +370,14 @@
   // ---------------------------------------------------------------- 模型与推理强度
 
   // 每条线索都记下来，用的时候取最新的一条：历史记录常常倒序加载，要等这批数据的时间戳补齐之后才能比较先后。
-  // 会话元数据会被反复拉取，值没变就不算新线索，免得盖过之后实时到达的事件
+  // 会话元数据会被反复拉取，值没变就不算新线索，免得盖过之后实时到达的事件。变了的是现在的状态（比如切走期间在别处改了
+  // 推理强度），当成刚到的：会话对象的时间戳是会话创建的时间，按它排会被切走之前留下的旧线索盖过
   function addInfo(key, value, src, ctx) {
     if (src === 'metadata' || src === 'session') {
       const k = src + ':' + key;
       const v = JSON.stringify(value === undefined ? null : value);
       if (state.metaSeen[k] === v) return;
+      if (k in state.metaSeen) ctx = { ...ctx, bulk: false, batch: null };
       state.metaSeen[k] = v;
     }
     const rec = { ...stamp(ctx), value, src };
@@ -408,13 +480,14 @@
     }
   }
 
-  // 会话列表里有很多会话，只认当前页面这个：会话 id 去掉前缀（session_ / cse_）后应出现在地址里
+  // 会话列表里有很多会话，只认这份状态所属的会话：会话 id 去掉前缀（session_ / cse_）后应出现在会话页面的地址里。
+  // 接口地址带会话 id 的已经归到了那个会话（routed），所以切换之前就拿到的会话信息也算数
   function isCurrentSession(o) {
     const id = o.id || o.session_id || o.uuid;
     if (id == null) return true;
     if (typeof id !== 'string') return false;
     const tail = id.replace(/^[a-z]+_/i, '');
-    return tail.length >= 10 && location.pathname.includes(tail);
+    return tail.length >= 10 && state.path.includes(tail);
   }
 
   // ---------------------------------------------------------------- 订阅额度
@@ -756,8 +829,8 @@
         if (exact && !s.bulk && !ctx.bulk) {
           // 有思考的请求，精确数里包含看不见的思考 token，不能拿来校准
           if (!s.thinking && s.est > 20) {
-            const ratio = exact / (s.est / state.calib);
-            if (ratio > 0.2 && ratio < 5) state.calib = state.calib * 0.7 + ratio * 0.3;
+            const ratio = exact / (s.est / calib);
+            if (ratio > 0.2 && ratio < 5) calib = calib * 0.7 + ratio * 0.3;
           }
           s.exact = exact;
         }
@@ -800,7 +873,7 @@
         return handleSystem(o, ctx);
       case 'conversation_reset': {
         // /clear：累计值从零重新开始，之前的上下文也作废了
-        const z = stamp(ctx);
+        const z = { ...stamp(ctx), sid: typeof o.session_id === 'string' ? o.session_id : '' };
         state.resets.push(z);
         if (ctx.batch) ctx.batch.push(z);
         state.rev++;
@@ -947,16 +1020,19 @@
     for (const k in o) if (o[k] && typeof o[k] === 'object') countTurns(o[k], depth + 1, acc);
   }
 
+  // src 是数据从哪个地址来的：带会话 id 的归到那个会话
   function ingestObj(obj, src) {
-    const acc = { n: 0 };
-    countTurns(obj, 0, acc);
-    const bulk = acc.n > 2;
-    const batch = bulk ? [] : null; // 这批历史记录里新建的记录，按出现顺序
-    walk(obj, { bulk, src, batch }, 0);
-    if (batch && batch.length) {
-      fillBatchTimes(batch);
-      sortResults(); // 时间戳补齐之后先后可能变了
-    }
+    routed(src, () => {
+      const acc = { n: 0 };
+      countTurns(obj, 0, acc);
+      const bulk = acc.n > 2;
+      const batch = bulk ? [] : null; // 这批历史记录里新建的记录，按出现顺序
+      walk(obj, { bulk, src, batch }, 0);
+      if (batch && batch.length) {
+        fillBatchTimes(batch);
+        sortResults(); // 时间戳补齐之后先后可能变了
+      }
+    });
   }
 
   // 历史记录里有些事件自己没有时间戳（比如 rate_limit_event）。同一批数据里事件的先后是可靠的，
@@ -968,7 +1044,7 @@
     let last = 0;
     for (const x of list) {
       if (x.ts) last = x.ts;
-      else if (last) x.ts = ++last; // 连续几个没有时间戳的事件依次排开
+      else if (last) noteHist((x.ts = ++last)); // 连续几个没有时间戳的事件依次排开
     }
   }
 
@@ -995,11 +1071,12 @@
     for (const line of text.split('\n')) ingestLine(line, src);
   }
 
-  // 网页发出去的数据只看切换模型、改推理强度这两种控制请求，别的一概不碰
-  function ingestOutgoing(body) {
+  // 网页发出去的数据只看切换模型、改推理强度这两种控制请求，别的一概不碰。url 带会话 id 时记到那个会话
+  function ingestOutgoing(body, url) {
     if (typeof body !== 'string' || body.length > 2e6 || !/set_model|apply_flag_settings/.test(body)) return;
     try {
-      findRequests(JSON.parse(body), 0);
+      const o = JSON.parse(body);
+      routed(url, () => findRequests(o, 0));
     } catch {}
   }
 
@@ -1023,20 +1100,26 @@
   // ---------------------------------------------------------------- 统计
 
   // 累计值在 /clear 之后、或者续接时没有存档的情况下会从零重新开始。按先后把 result 分成几段（同一段里
-  // 累计值只增不减），各段最后一条相加才是整个会话的用量
-  let runsCache = null;
+  // 累计值只增不减），各段最后一条相加才是整个会话的用量。累计值只在同一个 CLI 会话里连续：一个页面里混着几个会话的
+  // result 时（比如频道页），各会话分开分段，不拿两个会话的累计值相减。最后一段是最近结束的
   function runs(s = state) {
-    if (runsCache && runsCache.state === s && runsCache.rev === s.rev) return runsCache.list;
+    if (s.runCache && s.runCache.rev === s.rev) return s.runCache.list;
     const list = [];
-    let cur = null;
-    let prev = null;
-    for (const r of s.results) {
-      if (prev && sameResult(prev, r)) continue; // 同一条 result 从两个通道各来了一次，或者是没有请求的一轮
-      if (!prev || restarted(prev, r, s.resets)) list.push((cur = []));
-      cur.push(r);
-      prev = r;
-    }
-    runsCache = { state: s, rev: s.rev, list };
+    const open = new Map(); // CLI 会话 -> 它现在这一段
+    const end = new Map(); // 段 -> 最后一条在 results 里的位置
+    s.results.forEach((r, i) => {
+      let run = open.get(r.sid);
+      const prev = run && run[run.length - 1];
+      if (prev && sameResult(prev, r)) return; // 同一条 result 从两个通道各来了一次，或者是没有请求的一轮
+      if (!prev || restarted(prev, r, s.resets)) {
+        list.push((run = []));
+        open.set(r.sid, run);
+      }
+      run.push(r);
+      end.set(run, i);
+    });
+    list.sort((a, b) => end.get(a) - end.get(b));
+    s.runCache = { rev: s.rev, list };
     return list;
   }
 
@@ -1051,29 +1134,45 @@
       for (const k of KINDS) if (r.totals[k] < p.totals[k]) return true;
       for (const name in p.byModel) if (!r.byModel[name]) return true; // 某个模型的累计值不见了
     }
-    return resets.some((z) => isAfter(z, p) && isAfter(r, z)); // 两条之间有 /clear
+    return resets.some((z) => (!z.sid || z.sid === r.sid) && isAfter(z, p) && isAfter(r, z)); // 两条之间有这个会话的 /clear
+  }
+
+  // 点 ↺ 那一刻之前的最后一条 result（没点 ↺，或者那之前还没有 result 时为 null）：本会话的统计从它之后算起
+  function tripBase() {
+    if (!state.since) return null;
+    let b = null;
+    for (const r of state.results) if (!isAfter(r, state.since)) b = r;
+    return b;
   }
 
   function sessionTotals() {
-    const t = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, thinking: 0, cost: 0, approx: false, approxCost: false, runs: 0, models: {} };
-    let base = null; // 最后一条 result
+    const since = state.since;
+    const t = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, thinking: 0, cost: 0, approx: false, approxCost: false, runs: 0, models: {}, since: since ? since.at : 0 };
+    let last = null; // 最后一条 result
     for (const run of runs()) {
       const r = run[run.length - 1];
+      // 点了 ↺ 时，减去这一段在那一刻之前的最后一条
+      let b = null;
+      if (since) for (const x of run) if (!isAfter(x, since)) b = x;
       t.runs++;
-      t.cost += r.cost;
-      t.thinking += r.thinking;
-      if (r.totals) for (const k of KINDS) t[k] += r.totals[k];
+      last = r;
+      if (b === r) continue;
+      t.cost += r.cost - (b ? b.cost : 0);
+      t.thinking += r.thinking - (b ? b.thinking : 0);
+      if (r.totals) for (const k of KINDS) t[k] += r.totals[k] - (b && b.totals ? b.totals[k] : 0);
       for (const name in r.byModel) {
+        const x = r.byModel[name];
+        const y = (b && b.byModel[name]) || { cost: 0, output: 0 };
+        if (x.cost === y.cost && x.output === y.output) continue;
         const s = (t.models[modelName(name) || name] ||= { cost: 0, output: 0 });
-        s.cost += r.byModel[name].cost;
-        s.output += r.byModel[name].output;
+        s.cost += x.cost - y.cost;
+        s.output += x.output - y.output;
       }
-      base = r;
     }
     // 本轮还没结束的请求：用量按事件累加，费用按上一段的平均单价估算
     let pending = 0;
     for (const m of state.messages.values()) {
-      if (base && !isAfter(m, base)) continue; // 已计入 result 的累计值
+      if (last && !isAfter(m, last)) continue; // 已计入 result 的累计值
       const out = messageOutput(m);
       t.input += m.input;
       t.output += out;
@@ -1082,11 +1181,12 @@
       pending += weightOf(m, out);
       if (!m.exact) t.approx = true;
     }
-    if (pending && base && base.totals && base.cost) {
-      t.cost += (base.cost / weightOf(base.totals, base.totals.output)) * pending;
+    if (pending && last && last.totals && last.cost) {
+      t.cost += (last.cost / weightOf(last.totals, last.totals.output)) * pending;
       t.approxCost = true;
     }
-    t.requests = state.messages.size;
+    const tb = tripBase();
+    t.requests = tb ? [...state.messages.values()].filter((m) => isAfter(m, tb)).length : state.messages.size;
     return t;
   }
 
@@ -1198,13 +1298,14 @@
   }
 
   // { ttl, ttlKnown, warmAt, expiresAt, tokens: 下一次请求的上下文, nextExtra: 缓存过期后下一次请求多花的钱,
-  //   listed, rebuilds: [{ t, tokens, cause, expected, extra }] }
+  //   listed, since: 点 ↺ 的时间, rebuilds: [{ t, tokens, cause, expected, extra, counted: 在 ↺ 之后 }] }
   // c、mi 是 contextNow()、modelInfo() 的结果，重绘时已经算过就传进来
   function cacheState(c = contextNow(), mi = modelInfo()) {
     const main = [];
     for (const m of state.messages.values()) if (m.lane === 'main' && orderKey(m) != null && messageContext(m) > 0) main.push(m);
     if (!main.length) return null;
-    main.sort((a, b) => orderKey(a) - orderKey(b));
+    main.sort(byOrder);
+    const tb = tripBase();
     let ttl = '';
     for (let i = main.length - 1; i >= 0 && !ttl; i--) ttl = main[i].ttl;
     const ttlKnown = !!ttl;
@@ -1230,7 +1331,7 @@
       else cause = '原因不明：工具、系统提示或较早的消息变了';
       const pr = cachePrices(m.model, prev, m.ttl || ttl, m.fast);
       const extra = expected || !pr ? 0 : missed * ((m.cacheWrite >= missed / 2 ? pr.write : pr.input) - pr.read);
-      rebuilds.push({ t: wallOf(m), tokens: missed, cause, expected, extra });
+      rebuilds.push({ t: wallOf(m), tokens: missed, cause, expected, extra, counted: !tb || isAfter(m, tb) });
     }
 
     const last = main[main.length - 1];
@@ -1245,6 +1346,7 @@
       tokens,
       nextExtra: pr && tokens ? tokens * (pr.write - pr.read) : 0,
       listed: !!pr && pr.listed,
+      since: state.since ? state.since.at : 0,
       rebuilds,
     };
   }
@@ -1264,8 +1366,9 @@
     out * PRICE_RATIO.output +
     x.cacheRead * PRICE_RATIO.cacheRead +
     x.cacheWrite * PRICE_RATIO.cacheWrite;
-  // 实时事件按到达顺序排在所有历史记录之后；排不了序的历史记录不参与
-  const orderKey = (x) => (x.live ? 1e15 + x.seq : x.ts || null);
+  // 排序用的位置，和 isAfter 一致：实时事件用 pos，历史记录用时间戳；排不了序的历史记录不参与。同一毫秒到达的实时事件按到达顺序
+  const orderKey = (x) => (x.live ? x.pos : x.ts || null);
+  const byOrder = (a, b) => orderKey(a) - orderKey(b) || (a.live && b.live ? a.seq - b.seq : 0);
 
   function weightedMedian(list) {
     // list: [[值, 权重]]
@@ -1286,7 +1389,7 @@
     for (const m of state.messages.values()) if (orderKey(m) != null) items.push([orderKey(m), 0, m]);
     for (const r of state.results) if (orderKey(r) != null) items.push([orderKey(r), 1, r]);
     for (const q of state.readings) if (orderKey(q) != null) items.push([orderKey(q), 2, q]);
-    items.sort((a, b) => a[0] - b[0]);
+    items.sort((a, b) => byOrder(a[2], b[2]));
     const prevOf = new Map(); // result -> 同一段里的上一条（段落第一条为 null；重复的 result 不在里面）
     for (const run of runs()) run.forEach((r, i) => prevOf.set(r, i ? run[i - 1] : null));
 
@@ -1449,7 +1552,7 @@
     if (quotaCache && now - quotaAt < 3000) return quotaCache;
     quotaAt = now;
     const mine = sessionQuotaRates();
-    const key = location.pathname;
+    const key = state.path;
     const old = rateStore[key] && rateStore[key].r;
     // 重开会话时历史可能只加载了一部分，算出来的依据更少，这时留着存下的那份
     if (Object.keys(mine).length && JSON.stringify(mine) !== JSON.stringify(old) && ratePoints(mine) >= ratePoints(old)) {
@@ -1517,8 +1620,9 @@
   // 也可能有同一段（实测见过）。所以不分会话，按 result 的 uuid 记下哪些轮记过账，只记没记过的
   // { v: 2, at, days: { 'YYYY-MM-DD': { 模型: [输入, 输出, 缓存读, 缓存写, 美元, 轮数] } },
   //   ids: { 'YYYY-MM-DD': 那天记过账的 uuid 前 12 位，空格分隔 },
-  //   sessions: { 路径: { id, t, c: { 模型: [输入, 输出, 缓存读, 缓存写, 美元] } } } }
-  // sessions 是每个会话最后一条记过账的 result，历史只加载了一部分、看不到同一段里的上一条时拿它的累计值做减数。
+  //   sessions: { 'sid:<CLI 会话 id>' 或页面地址: { id, t, c: { 模型: [输入, 输出, 缓存读, 缓存写, 美元] } } } }
+  // sessions 是每个会话最后一条记过账的 result（水位线），历史只加载了一部分、看不到同一段里的上一条时拿它的累计值做减数。
+  // 按 result 里的 CLI 会话 id 记：同一个会话在频道页、别的会话地址下看到的也接得上；没有会话 id 的按页面地址记。
   // v1 只按会话记水位线：同一轮出现在两个会话地址下会记两次，水位线之前晚到的历史又永远补不上。和 v2 接不上，换了新键
   const LEDGER_KEY = 'ctm-ledger-v2';
   // 记过账的 uuid 和水位线保留这么久；比这更早的 result 不记，否则 uuid 清掉之后重开旧会话会重复记账
@@ -1542,7 +1646,6 @@
   // 记账用的编号：uuid 前 12 位。没有 uuid 的 result（少见）用累计费用和输出量代替
   const idOf = (r) => (r.id ? r.id.slice(0, 12) : '#' + Math.round(r.cost * 1e6) + '.' + (r.totals ? r.totals.output : 0));
   let ledger = readLedger();
-  let ledgerSeen = null; // 上次记账时的状态和版本
   let ledgerBusy = false;
   W.addEventListener('storage', (e) => {
     if (e.key !== LEDGER_KEY) return;
@@ -1596,24 +1699,28 @@
     for (const k in book.sessions) if (!(now - num(book.sessions[k] && book.sessions[k].t) < LEDGER_KEEP_MS)) delete book.sessions[k];
   }
 
-  // 把这个会话里还没记过账的几轮记进账本。账本每次都从 localStorage 重新读，并且在多个标签页之间加锁：
+  // 把一个会话（st）里还没记过账的几轮记进账本。账本每次都从 localStorage 重新读，并且在多个标签页之间加锁：
   // 另一个标签页刚记过的，这里就不会再记
-  function updateLedger() {
+  function updateLedger(st) {
     if (ledgerBusy) return;
-    const st = state; // 等锁期间切换了会话也照样记在原来的会话名下
-    ledgerSeen = { state: st, rev: st.rev };
+    st.ledgerRev = st.rev;
     const work = safe(() => {
       const list = runs(st);
       if (!list.length) return;
       const now = Date.now();
       const book = (ledger = readLedger()); // 显示也跟着用最新的
       const booked = new Set(Object.values(book.ids).join(' ').split(' '));
-      const mark = book.sessions[st.path];
-      // 水位线那条不在这次加载到的历史里（历史只加载了一部分，或者 uuid 对不上）：不晚于它的、累计值和它一样的都算记过
-      const hidden = !!mark && !list.some((run) => run.some((r) => idOf(r) === mark.id));
+      const shown = new Set(); // 这次加载到的
+      for (const run of list) for (const r of run) shown.add(idOf(r));
+      const markKey = (r) => (r.sid ? 'sid:' + r.sid : st.path);
+      const joined = new Set(); // 每个会话只有第一条看不到上一条的 result 能接水位线
+      const fresh = new Set(); // 这次记了新轮次的会话
       let changed = false;
-      let first = true;
       for (const run of list) {
+        const key = markKey(run[0]);
+        const mark = book.sessions[key];
+        // 水位线那条不在这次加载到的历史里（历史只加载了一部分，或者 uuid 对不上）：不晚于它的、累计值和它一样的都算记过
+        const hidden = !!mark && !shown.has(mark.id);
         // 一段里最后一条记过账的之前都不用再看：它们要么记过，要么已经含在那一条里（它看不到上一条时按整段累计值记），
         // 要么超过了保留期。没记过账的段从头记，这样先看到最新一轮、后来才加载到的历史也能补上
         let start = 0;
@@ -1625,20 +1732,24 @@
           const t = r.ts || r.at;
           const c = cumOf(r);
           // 看不到同一段里的上一条：水位线之后的第一条各项都不小于水位线的，和水位线在同一段，减去水位线；否则是新的一段，从零开始
-          const base = j ? cumOf(run[j - 1]) : first && hidden && covers(c, mark.c) ? mark.c : null;
-          first = false;
+          const base = j ? cumOf(run[j - 1]) : hidden && !joined.has(key) && covers(c, mark.c) ? mark.c : null;
+          joined.add(key);
           if (now - t > LEDGER_KEEP_MS) continue;
           addTurn(book, dayKey(t), c, base);
           booked.add(idOf(r));
           book.ids[dayKey(t)] = (book.ids[dayKey(t)] ? book.ids[dayKey(t)] + ' ' : '') + idOf(r);
+          fresh.add(key);
           changed = true;
         }
       }
-      // 水位线：这个会话里最后一条记过账的，包括在别的会话地址下记的
-      let last = null;
-      for (const run of list) for (const r of run) if (booked.has(idOf(r))) last = r;
-      if (last && !(mark && mark.id === idOf(last))) {
-        book.sessions[st.path] = { id: idOf(last), t: last.ts || last.at, c: cumOf(last) };
+      // 水位线：每个会话最后一条记过账的，包括在别的页面、别的会话地址下记的。只在这次记了新轮次（或者还没有水位线）时挪：
+      // 别的标签页里只看到较早几轮的不能把它拉回去，否则之后只看到最新一轮时会把中间几轮再记一遍
+      const last = new Map();
+      for (const run of list) for (const r of run) if (booked.has(idOf(r))) last.set(markKey(r), r);
+      for (const [key, r] of last) {
+        const mark = book.sessions[key];
+        if (mark && (mark.id === idOf(r) || !fresh.has(key))) continue;
+        book.sessions[key] = { id: idOf(r), t: r.ts || r.at, c: cumOf(r) };
         changed = true;
       }
       if (!changed) return;
@@ -1719,7 +1830,7 @@
       first: days[0] || null,
       turns: Object.values(ledger.ids).reduce((s, x) => s + x.split(' ').length, 0),
       sessions: Object.keys(ledger.sessions).length,
-      thisSession: !!ledger.sessions[state.path],
+      thisSession: !!ledger.sessions[state.path] || state.results.some((r) => r.sid && ledger.sessions['sid:' + r.sid]),
       at: ledger.at ? new Date(ledger.at).toISOString() : null,
       bytes: (lsGet(LEDGER_KEY) || '').length,
     };
@@ -1759,7 +1870,7 @@
       const url = typeof input === 'string' ? input : input && (input.url || String(input));
       safe(() => {
         noteUrl(url);
-        if (init && typeof init.body === 'string') ingestOutgoing(init.body);
+        if (init && typeof init.body === 'string') ingestOutgoing(init.body, url);
       })();
       const p = origFetch.apply(this, arguments);
       p.then(
@@ -1781,27 +1892,29 @@
   if (XHR) {
     const origOpen = XHR.open;
     XHR.open = function (method, url) {
-      safe(noteUrl)(String(url));
+      this.__ctmUrl = String(url); // 按地址里的会话 id 归到对应的会话
+      safe(noteUrl)(this.__ctmUrl);
       return origOpen.apply(this, arguments);
     };
     const origSend = XHR.send;
     XHR.send = function (body) {
-      safe(ingestOutgoing)(body);
+      const url = this.__ctmUrl;
+      safe(ingestOutgoing)(body, url);
       let pos = 0;
       let buf = '';
       const xhr = this;
       const pump = safe((final) => {
         if (xhr.responseType && xhr.responseType !== 'text') return;
         const txt = xhr.responseText || '';
-        if (final && pos === 0) return ingestText(txt, 'xhr');
+        if (final && pos === 0) return ingestText(txt, url);
         buf += txt.slice(pos);
         pos = txt.length;
         const i = buf.lastIndexOf('\n');
         if (i >= 0) {
-          for (const line of buf.slice(0, i).split('\n')) ingestLine(line, 'xhr');
+          for (const line of buf.slice(0, i).split('\n')) ingestLine(line, url);
           buf = buf.slice(i + 1);
         }
-        if (final && buf) ingestLine(buf, 'xhr');
+        if (final && buf) ingestLine(buf, url);
       });
       this.addEventListener('progress', () => {
         const ct = xhr.getResponseHeader('content-type') || '';
@@ -1823,10 +1936,10 @@
     const WS = function (url, protocols) {
       const ws = protocols === undefined ? new OrigWS(url) : new OrigWS(url, protocols);
       log('websocket', url);
-      ws.addEventListener('message', safe((e) => ingestBinaryOrText(e.data, 'ws')));
+      ws.addEventListener('message', safe((e) => ingestBinaryOrText(e.data, String(url))));
       const send = ws.send;
       ws.send = function (data) {
-        safe(ingestOutgoing)(data);
+        safe(ingestOutgoing)(data, String(url));
         return send.apply(this, arguments);
       };
       return ws;
@@ -1839,7 +1952,7 @@
   const OrigES = W.EventSource;
   if (OrigES) {
     const origAdd = OrigES.prototype.addEventListener;
-    const tap = safe((e) => ingestText(e.data, 'sse'));
+    const tap = safe((e) => ingestText(e.data, e.target && e.target.url));
     const ES = function (url, init) {
       const es = new OrigES(url, init);
       log('eventsource', url);
@@ -1860,13 +1973,23 @@
     W.EventSource = ES;
   }
 
-  // 切换会话（SPA 路由变化）时清零
+  // 切换会话（SPA 路由变化）时换成那个会话的状态。不能清零：网页切回看过的会话时只补拉最新的事件，
+  // 清零的话面板上就只剩最新一轮（实测：先有 navigate，之后才请求 events?sort_order=asc&cursor=… 和 events?limit=20）
   let lastPath = location.pathname;
   const onNav = () => {
     if (location.pathname !== lastPath) {
       lastPath = location.pathname;
-      log('navigate', lastPath); // 和 fetch / websocket 的日志对照，看历史是在切换会话之前还是之后加载的
-      reset();
+      log('navigate', lastPath); // 和 fetch / websocket 的日志对照，看数据是在切换会话之前还是之后到的
+      const next = stateFor(lastPath);
+      if (next !== state) {
+        // 实时流只对正在看的会话有意义：切走时收起来，免得切回来还显示成进行中、速度曲线还是上次的
+        state.lanes.clear();
+        state.samples = [];
+        state.spark = [];
+        state = next;
+        quotaCache = null;
+      }
+      dirty = true;
     }
   };
   for (const m of ['pushState', 'replaceState']) {
@@ -1988,8 +2111,11 @@
         readings: state.readings.length,
         resets: state.resets.length,
         lanes: state.lanes.size,
+        sessions: states.size, // 这个标签页里留着状态的会话（和页面）
+        cliSessions: new Set(state.results.map((r) => r.sid)).size,
       },
-      calib: +state.calib.toFixed(3),
+      trip: state.since ? new Date(state.since.at).toISOString() : null,
+      calib: +calib.toFixed(3),
       types: state.types,
     };
   }
@@ -2153,6 +2279,7 @@
     .icon { flex: none; width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0;
       border-radius: 6px; background: transparent; color: var(--ink2); font: 14px/1 system-ui, sans-serif; cursor: pointer; }
     .icon:hover { background: var(--control); color: var(--ink); }
+    .icon.on { background: var(--chipBg); color: var(--chipInk); }
     button:focus-visible, .pill:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     .body { padding: 10px 12px; }
     .hero { display: flex; align-items: baseline; gap: 5px; }
@@ -2206,10 +2333,11 @@
   function addRow(parent, label, tip) {
     const row = h('div', 'row');
     const value = h('span', 'value', '–');
-    row.append(h('span', 'label', label), value);
+    const name = h('span', 'label', label);
+    row.append(name, value);
     if (tip) row.title = tip;
     parent.append(row);
-    return { row, value };
+    return { row, label: name, value };
   }
 
   // 比例条：填充色表示程度（正常用强调色，偏高用警告色，接近上限用危险色），底槽是同一色调的浅色
@@ -2267,6 +2395,7 @@
   const limitShort = (l) => (l.expired ? '已重置' : fmtPct(l.used));
 
   const ui = { limitRows: {} };
+  const PILL_TIP = '模型 · 速度（空闲时为上轮均速）· 上下文 · 订阅额度 · API 等价费用\n点击展开，拖动可移动';
   let mode = lsGet('ctm-mode') === 'full' ? 'full' : 'compact';
   let view = 'live'; // 完整面板显示本会话（live）还是用量汇总（summary）
   let period = 'day';
@@ -2411,7 +2540,7 @@
     const pill = (ui.pill = h('div', 'pill'));
     pill.tabIndex = 0;
     pill.setAttribute('role', 'button');
-    pill.title = '模型 · 速度（空闲时为上轮均速）· 上下文 · 订阅额度 · API 等价费用\n点击展开，拖动可移动';
+    pill.title = PILL_TIP;
     ui.pillDot = h('span', 'dot');
     ui.pillText = h('span', 'pill-text');
     pill.append(ui.pillDot, ui.pillText);
@@ -2439,7 +2568,8 @@
       b.addEventListener('click', onClick);
       return b;
     };
-    head.append(ui.dot, title, iconBtn('↺', '清零本会话的统计（订阅额度不清）', reset), iconBtn('–', '收起成一行', () => setMode('compact')));
+    ui.tripBtn = iconBtn('↺', '', toggleTrip);
+    head.append(ui.dot, title, ui.tripBtn, iconBtn('–', '收起成一行', () => setMode('compact')));
     draggable(head);
 
     const body = h('div', 'body');
@@ -2784,7 +2914,8 @@
     state.spark.push(live.speed);
     if (state.spark.length > SPARK_POINTS) state.spark.shift();
     if (live.speed > state.peak) state.peak = live.speed;
-    if (state.results.length && (!ledgerSeen || ledgerSeen.state !== state || ledgerSeen.rev !== state.rev)) updateLedger();
+    // 每个会话都记账，包括不是当前页面的（切换之后才到的、频道页上加载的）
+    for (const st of states.values()) if (st.results.length && st.ledgerRev !== st.rev) updateLedger(st);
     pollAfterReset();
     if (!ui.root) return;
     if (!ui.host.isConnected && document.body) document.body.append(ui.host); // 页面重建 body 内容时放回去
@@ -2821,6 +2952,7 @@
     if (mode === 'compact') paintCompact(v);
     else {
       paintHeader(v.mi);
+      paintTrip();
       if (view === 'summary') paintSummary();
       else paintFull(v);
       paintFoot();
@@ -2841,11 +2973,14 @@
     // 缓存快过期时提醒：上下文大的时候，过期后的第一条消息要多花不少
     const left = v.cache && !v.active && v.cache.tokens >= 50000 ? v.cache.expiresAt - Date.now() : 0;
     if (left > 0 && left <= 600000) parts.push(['缓存 ' + fmtSpan(left), 'warning']);
-    if (v.t.cost) parts.push([(v.t.approxCost ? '≈' : '') + fmtCost(v.t.cost, true)]);
+    // 点了 ↺ 时费用前面带个 ↺：只算那之后的
+    const trip = v.t.since ? fmtReset(v.t.since / 1000) : '';
+    if (v.t.cost || trip) parts.push([(trip ? '↺ ' : '') + (v.t.approxCost ? '≈' : '') + (v.t.cost ? fmtCost(v.t.cost, true) : '$0')]);
     if (!parts.length) parts.push(['Token Meter']);
     const key = JSON.stringify(parts);
     if (key === pillKey) return;
     pillKey = key;
+    ui.pill.title = PILL_TIP + (trip ? '\n↺：费用从 ' + trip + ' 开始计' : '');
     ui.pillText.textContent = '';
     parts.forEach(([text, level, extra], i) => {
       if (i) ui.pillText.append(h('span', 'muted', '·'));
@@ -2897,6 +3032,17 @@
       c.title = tip + '\n' + ui.model.title;
       ui.chips.append(c);
     }
+  }
+
+  function paintTrip() {
+    const on = !!state.since;
+    const tip = on
+      ? '恢复整个会话的统计（现在是从 ' + fmtReset(state.since.at / 1000) + ' 开始计的）'
+      : '从现在开始计：本会话的费用、token、请求数从零算起，再点一下恢复（订阅额度和用量汇总不受影响）';
+    ui.tripBtn.classList.toggle('on', on);
+    ui.tripBtn.setAttribute('aria-pressed', String(on));
+    ui.tripBtn.setAttribute('aria-label', tip);
+    ui.tripBtn.title = tip;
   }
 
   function paintHero(v) {
@@ -2966,7 +3112,7 @@
 
   function paintCache(cs, active) {
     const show = !!cs && cs.tokens > 0;
-    const wasted = show ? cs.rebuilds.filter((r) => !r.expected) : [];
+    const wasted = show ? cs.rebuilds.filter((r) => !r.expected && r.counted) : [];
     ui.cache.row.style.display = show ? '' : 'none';
     ui.cacheEst.style.display = wasted.length ? '' : 'none';
     if (!show) return;
@@ -2982,7 +3128,8 @@
       '，也照样消耗订阅额度。';
     if (wasted.length) {
       const sum = wasted.reduce((s, r) => s + r.extra, 0);
-      ui.cacheEst.textContent = '本会话缓存重建 ' + wasted.length + ' 次' + (sum ? ' · 约多花 ' + fmtDollars(sum) : '');
+      ui.cacheEst.textContent =
+        (cs.since ? fmtReset(cs.since / 1000) + ' 起' : '本会话') + '缓存重建 ' + wasted.length + ' 次' + (sum ? ' · 约多花 ' + fmtDollars(sum) : '');
       ui.cacheEst.title =
         '/clear 和上下文压缩之后的重建是正常的，不算在内。最近几次：\n' +
         wasted
@@ -3071,9 +3218,12 @@
     paintCache(v.cache, v.active);
     paintLimits(lims);
 
-    ui.cost.value.textContent = t.cost ? (t.approxCost ? '≈' : '') + fmtCost(t.cost) : '–';
+    const trip = t.since ? fmtReset(t.since / 1000) : '';
+    ui.cost.label.textContent = 'API 等价费用' + (trip ? ' · ' + trip + ' 起' : '');
+    ui.cost.value.textContent = t.cost || trip ? (t.approxCost ? '≈' : '') + (t.cost ? fmtCost(t.cost) : '$0') : '–';
     ui.cost.row.title =
       'Claude Code 按 API 标价估算的累计费用，订阅用户不按此计费。' +
+      (trip ? `\n从 ${trip} 开始计（点了 ↺）：费用、token、请求数都只算那之后的轮次。再点一下 ↺ 恢复整个会话的统计。` : '') +
       (t.runs > 1 ? `\n这个会话里累计值重新开始过 ${t.runs - 1} 次（/clear 或续接），已分段相加。` : '') +
       (t.approxCost ? '\n≈：本轮还没结束，未结束部分按最近的平均单价估算。' : '');
     ui.output.textContent = (t.approx ? '≈' : '') + fmt(t.output);
@@ -3134,7 +3284,7 @@
     diagnostics,
     pollUsage: () => pollUsage(true),
     mode: (m) => setMode(m === 'full' ? 'full' : 'compact'),
-    reset,
+    trip: toggleTrip, // 和 ↺ 一样：从现在开始计，再调一次恢复
     debug(on = true) {
       debug = !!on;
       lsSet('ctm-debug', debug ? '1' : '0');
