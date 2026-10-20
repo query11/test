@@ -6,7 +6,7 @@
 
 - 仓库只有一个油猴脚本 `claude-token-meter.user.js`（单文件，约 3080 行）、`README.md`、截图 `shot.png`，以及 `tests/`。
 - 默认分支是 `claude/clever-mendel-97x9jy`。README 里的安装链接和 Tampermonkey 的自动更新都指向默认分支（`@updateURL` 用的是 `HEAD`），合并进去用户才会收到新版本。
-- **都还没合并**：1.5.1 在分支 `claude/brave-mayer-qf593f` 上；1.6.0 在分支 `claude/gallant-shannon-8k18g1` 上，是基于 1.5.1 做的，包含它。合并 `claude/gallant-shannon-8k18g1` 就把两个版本一起带进去了。新窗口里先看合并了没有；没合并就基于 `claude/gallant-shannon-8k18g1` 继续。
+- 1.5.1（分支 `claude/brave-mayer-qf593f`）和 1.6.0（分支 `claude/gallant-shannon-8k18g1`，基于 1.5.1）已经在 2026-10-20 快进合并进默认分支，安装链接和自动更新拿到的就是 1.6.0。之后的工作从默认分支开始。
 
 ### 1.5.1 做了什么
 
@@ -131,4 +131,4 @@ localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-his
 
 ## 新窗口的开场提示（可以直接粘贴）
 
-> 读一下仓库根目录的 HANDOFF.md。如果分支 claude/gallant-shannon-8k18g1 还没合并进默认分支，就基于它继续。实现待办第 1 项“额度窗口重置后马上刷新”：按里面的做法和测试做，做完更新 README 和 HANDOFF.md。
+> 读一下仓库根目录的 HANDOFF.md，基于默认分支继续。实现待办第 1 项“额度窗口重置后马上刷新”：按里面的做法和测试做，做完更新 README 和 HANDOFF.md。
