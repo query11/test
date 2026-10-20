@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.5.0
+// @version      1.5.1
 // @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示模型、推理强度、token 用量、生成速度、提示缓存与订阅额度
 // @homepageURL  https://github.com/query11/test
 // @downloadURL  https://raw.githubusercontent.com/query11/test/HEAD/claude-token-meter.user.js
@@ -37,9 +37,12 @@
   const W = window;
   if (W.__ctm) return;
 
-  const VERSION = '1.5.0';
+  const VERSION = '1.5.1';
   const FLOW_MS = 1500; // 这么久内收到过 token 视为“正在输出”
-  const STALE_MS = 60000; // 流式请求这么久没动静就当作已结束（防止漏掉 message_stop）
+  // 流式请求这么久没动静就不再显示为进行中（防止漏掉 message_stop 时一直亮着）。只影响显示：
+  // 这一路的统计留着，之后再来增量照常计入，真正结束看 message_stop / 下一个 message_start / result
+  const STALE_MS = 60000;
+  const WAIT_MS = 600000; // 还没有任何输出时（多半在思考，网页端看不到思考内容）允许等得更久
   const SPEED_WINDOW_MS = 2000; // 实时速度的滑动窗口
   const HISTORY_AGE_MS = 600000; // 带时间戳且早于 10 分钟的事件视为历史（留出本机时钟误差）
   const SPARK_POINTS = 120; // 速度曲线保留的点数（每 500ms 一个）
@@ -196,6 +199,11 @@
   }
 
   function recordResult(o, ctx) {
+    if (!ctx.bulk && state.lanes.size) {
+      // 一轮结束了（出错、被打断的也算），还开着的流也都结束了
+      for (const lane of [...state.lanes.keys()]) closeLane(lane, performance.now());
+      dirty = true;
+    }
     const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
     const byModel = {}; // 各模型的累计值，包括费用和思考 token（已含在输出里）
     let thinking = 0;
@@ -244,11 +252,7 @@
     if (ctx.batch) ctx.batch.push(r);
     sortResults();
     if (o.fast_mode_state) addInfo('fast', o.fast_mode_state, 'result', ctx);
-    if (!ctx.bulk) {
-      // 一轮结束了，还开着的流也都结束了；额度刚变过，稍后刷新一次
-      for (const lane of [...state.lanes.keys()]) closeLane(lane, performance.now());
-      setTimeout(() => pollUsage(true), 4000);
-    }
+    if (!ctx.bulk) setTimeout(() => pollUsage(true), 4000); // 额度刚变过，稍后刷新一次
   }
 
   function sortResults() {
@@ -267,9 +271,11 @@
     if (!s) return;
     state.lanes.delete(lane);
     if (s.bulk || !s.last) return;
-    // 有精确数（含看不见的思考）时从 message_start 算起，否则只算收到增量的这段时间
+    // 有精确数（含看不见的思考）时从 message_start 算起，否则只算收到增量的这段时间。
+    // 漏了 message_stop、过了很久才被 result 关掉时，结束时间不晚于最后一次增量
     const tokens = s.exact || s.est + s.think;
-    const dur = ((s.exact ? end || s.last : s.last) - (s.exact ? s.t0 : s.first)) / 1000;
+    const stop = s.exact ? Math.min(end || s.last, s.last + FLOW_MS) : s.last;
+    const dur = (stop - (s.exact ? s.t0 : s.first)) / 1000;
     state.lastResp = { tokens, speed: dur > 0.3 ? tokens / dur : null, exact: !!s.exact };
     dirty = true;
   }
@@ -546,10 +552,14 @@
       const pts = hist && Math.abs(hist.resetsAt - l.resetsAt) <= 300 ? hist.pts.map(([t, u]) => [t, (top = Math.max(top, u))]) : [];
       let anchor = null;
       for (const look of [30, 60, 90]) {
-        const a = pts.filter((p) => p[0] <= now - look * 60000).pop();
+        const cut = now - look * 60000;
+        const i = pts.findIndex((p) => p[0] > cut);
+        const a = i < 0 ? pts[pts.length - 1] : pts[i - 1];
         if (!a) break;
-        anchor = a;
-        if (l.used - a[1] >= 0.03) break;
+        // 没变化的一段只存了头尾两点（见 notePoint）。回看的起点落在这样一段中间时，那一刻的读数就是这段的值，
+        // 从这一刻算起；取这段的开头会把回看拉长到闲置之前，速度被摊薄，预测偏晚
+        anchor = i >= 0 && pts[i][1] === a[1] ? [cut, a[1]] : a;
+        if (l.used - anchor[1] >= 0.03) break;
       }
       if (!anchor && pts.length && now - pts[0][0] >= 600000) anchor = pts[0];
       if (anchor) {
@@ -970,7 +980,8 @@
   }
 
   // message_stop、content_block_start、rate_limit_event 里没有 tokens；会话对象、用量接口里也不一定有
-  const WORTH_PARSING = /tokens|_delta|_start|_stop|rate_limit|external_metadata|effort|utilization|conversation_reset|"subtype"/i;
+  // （用量接口的新格式只有 limits[] 行的 percent / resets_at）
+  const WORTH_PARSING = /tokens|_delta|_start|_stop|rate_limit|external_metadata|effort|utilization|"percent"|conversation_reset|"subtype"/i;
 
   function ingestText(text, src) {
     if (typeof text !== 'string' || !text || text.length > 50e6) return;
@@ -2308,10 +2319,11 @@
 
   function render() {
     const now = performance.now();
-    for (const [lane, s] of state.lanes) if (now - (s.last || s.t0) > STALE_MS) closeLane(lane);
-    let active = null; // 最近有动静的实时请求
+    let active = null; // 最近有动静的实时请求。太久没动静的不算进行中，但不关掉：之后的增量还要计入
     for (const s of state.lanes.values()) {
-      if (!s.bulk && (!active || (s.last || s.t0) > (active.last || active.t0))) active = s;
+      const t = s.last || s.t0;
+      if (s.bulk || now - t > (s.last ? STALE_MS : WAIT_MS)) continue;
+      if (!active || t > (active.last || active.t0)) active = s;
     }
     const flowing = !!active && !!active.last && now - active.last < FLOW_MS;
     live = { active, flowing, thinking: flowing && now - active.thinkAt < FLOW_MS, speed: flowing ? currentSpeed(now, active) : 0 };
@@ -2633,6 +2645,9 @@
     },
     get limits() {
       return limits;
+    },
+    get live() {
+      return live; // 最近一次刷新时的流式状态：进行中的请求、是否在输出、实时速度
     },
     totals: sessionTotals,
     runs,

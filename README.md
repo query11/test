@@ -152,4 +152,22 @@ claude.ai 前端的内部接口没有公开文档，格式可能会变。排查�
 2. 点“调试”，打开 DevTools 控制台，发一条消息，看有没有 `[token-meter]` 日志：
    - 有 `fetch` / `websocket` 行但没有事件类型行 → 数据格式不同（或是二进制），把一段原始数据贴出来即可适配；
    - 一行都没有 → 数据走了脚本没挂钩的通道。
-3. 控制台里 `__ctm.state` 查看内部状态，`__ctm.totals()` / `__ctm.runs()` / `__ctm.model()` / `__ctm.context()` / `__ctm.cache()` / `__ctm.limits` / `__ctm.forecast()` / `__ctm.quota()` 查看计算结果，`__ctm.ingest('<json 文本>')` 手动喂数据测试。
+3. 控制台里 `__ctm.state` 查看内部状态，`__ctm.live` 查看当前的流式状态，`__ctm.totals()` / `__ctm.runs()` / `__ctm.model()` / `__ctm.context()` / `__ctm.cache()` / `__ctm.limits` / `__ctm.forecast()` / `__ctm.quota()` 查看计算结果，`__ctm.ingest('<json 文本>')` 手动喂数据测试。
+
+## 开发
+
+`tests/` 里是回归测试，不用装依赖（Node 20 以上），在仓库根目录运行：
+
+```
+node --test
+```
+
+`tests/harness.js` 在 Node 里加载脚本：桩掉用到的浏览器对象，时间由测试控制，不建面板；用 `__ctm.ingest` 喂 Claude Code stream-json 形状的事件，再检查 `__ctm` 算出的结果。
+用例覆盖实时流（长时间思考、子代理、漏掉 `message_stop`）、按 `/clear` 分段的累计值和去重、额度读数合并与用完时间预测、每 1% 折合多少美元（读数回落、闲置）。事件是照着脚本解析的格式构造的，不是录下来的真实数据。
+
+`CTM_SCRIPT` 可以换成别的版本跑同一组用例，比如确认新用例在修复前的版本上会失败：
+
+```
+git show HEAD~1:claude-token-meter.user.js > /tmp/old.user.js
+CTM_SCRIPT=/tmp/old.user.js node --test
+```
