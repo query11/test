@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Token Meter
 // @namespace    https://github.com/query11/test
-// @version      1.7.0
+// @version      1.7.1
 // @description  在 claude.ai（含 Claude Code 网页端 claude.ai/code）实时显示模型、推理强度、token 用量、生成速度、提示缓存与订阅额度
 // @homepageURL  https://github.com/query11/test
 // @downloadURL  https://raw.githubusercontent.com/query11/test/HEAD/claude-token-meter.user.js
@@ -37,7 +37,7 @@
   const W = window;
   if (W.__ctm) return;
 
-  const VERSION = '1.7.0';
+  const VERSION = '1.7.1';
   const FLOW_MS = 1500; // 这么久内收到过 token 视为“正在输出”
   // 流式请求这么久没动静就不再显示为进行中（防止漏掉 message_stop 时一直亮着）。只影响显示：
   // 这一路的统计留着，之后再来增量照常计入，真正结束看 message_stop / 下一个 message_start / result
@@ -1873,7 +1873,10 @@
       let changed = false;
       for (const run of list) {
         const key = markKey(run[0]);
-        const mark = book.sessions[key];
+        // 1.6.2 的水位线按页面地址记，1.6.3 起按 CLI 会话 id 记，换的时候没有搬过来。从 1.6.2 直接升级上来、在会话页面上
+        // 只看到最新一轮时，这个会话 id 下还没有水位线，会把整段累计值再记一遍（实测多记了一个会话的花费）。
+        // 所以按会话 id 找不到时，在会话页面上用这个页面地址下的。是不是同一段照样看 covers()，不是就从零开始
+        const mark = book.sessions[key] || (key !== st.path && sessionOf(st.path) ? book.sessions[st.path] : undefined);
         // 水位线那条不在这次加载到的历史里（历史只加载了一部分，或者 uuid 对不上）：不晚于它的、累计值和它一样的都算记过
         const hidden = !!mark && !shown.has(mark.id);
         // 一段里最后一条记过账的之前都不用再看：它们要么记过，要么已经含在那一条里（它看不到上一条时按整段累计值记），

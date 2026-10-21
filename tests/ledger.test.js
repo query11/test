@@ -377,3 +377,21 @@ test('导出 CSV：一行是“日期 + 模型”，模型写原始 id；诊断�
   assert.equal(diag.first, '2026-09-30');
   assert.equal(diag.sessions, 0);
 });
+
+test('从 1.6.2 升级上来：1.6.2 按页面地址记的水位线也接得上，切回会话只补拉到最新一轮时不把整段再记一遍', () => {
+  // 1.6.2 在这个会话页面上记过前两轮（水位线按页面地址），result 里有 CLI 会话 id
+  const r1 = result({ [OPUS]: { output: 1000, cost: 1 } }, { sid: 'cli-old' });
+  const r2 = result({ [OPUS]: { output: 2500, cost: 2.5 } }, { sid: 'cli-old' });
+  const book = {
+    v: 2,
+    at: local(19, 23),
+    days: { [key(19)]: { [OPUS]: [0, 2500, 0, 0, 2.5, 2] } },
+    ids: { [key(19)]: r1.uuid.slice(0, 12) + ' ' + r2.uuid.slice(0, 12) },
+    sessions: { [P]: { id: r2.uuid.slice(0, 12), t: local(19, 23), c: { [OPUS]: [0, 2500, 0, 0, 2.5] } } },
+  };
+  const h = load({ now: local(20, 10), storage: { [LEDGER]: JSON.stringify(book) } });
+  h.feed(history(at(result({ [OPUS]: { output: 4000, cost: 4 } }, { sid: 'cli-old' }), local(20, 0, 20))));
+  h.render();
+  near(today(h).cost, 1.5);
+  assert.equal(today(h).turns, 1);
+});
