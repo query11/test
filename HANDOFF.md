@@ -6,8 +6,7 @@
 
 - 仓库有一个油猴脚本 `claude-token-meter.user.js`（单文件，约 4150 行）、`README.md`、截图 `shot.png`（1.7.0 重新截了）、`tests/`，以及 CI 配置 `.github/workflows/test.yml`（push / PR 时跑 `node --test`）。
 - 默认分支是 `claude/clever-mendel-97x9jy`。README 里的安装链接和 Tampermonkey 的自动更新都指向默认分支（`@updateURL` 用的是 `HEAD`），合并进去用户才会收到新版本。合并后 raw.githubusercontent.com 的 `HEAD` 链接要过几分钟才变（实测约 3 分钟），按分支名的链接马上就是新的。
-- 1.5.1、1.6.0、1.6.1、1.6.2、1.6.3 都已经快进合并进默认分支（2026-10-20）。
-- **1.7.0 在分支 `claude/pensive-mendel-a00zxn` 上，还没有合并进默认分支**（合并前先问用户）。它是从默认分支的 1.6.3 直接接着做的，可以快进合并。
+- 1.5.1、1.6.0、1.6.1、1.6.2、1.6.3 都已经快进合并进默认分支（2026-10-20），1.7.0 也快进合并了（2026-10-21，用户同意的）。之后的工作从默认分支开始。
 
 ### 1.5.1 做了什么
 
