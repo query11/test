@@ -8,8 +8,10 @@ const SRC = fs.readFileSync(process.env.CTM_SCRIPT || path.join(__dirname, '..',
 
 // opts.now：起始时间（毫秒）；opts.storage：预置的 localStorage，对象会拷贝一份，传 Map 则直接共用
 // （模拟同一个浏览器里的两个标签页）；opts.path：页面路径（会话）；opts.locks：navigator.locks 的替身，默认没有；
-// opts.fetch：页面的 fetch（脚本加载时挂钩它，查用量接口也用它）；opts.cookie：document.cookie（当前组织在里面）。
-// 返回的 navigate(path) 像网页切换会话那样改地址（history.pushState），feedFrom(url, ...) 喂从某个接口地址来的数据
+// opts.fetch：页面的 fetch（脚本加载时挂钩它，查用量接口也用它）；opts.cookie：document.cookie（当前组织在里面）；
+// opts.Notification：浏览器通知的替身（见 fakeNotification）。
+// 返回的 navigate(path) 像网页切换会话那样改地址（history.pushState），feedFrom(url, ...) 喂从某个接口地址来的数据，
+// setHidden(true) 把标签页切到后台
 function load(opts = {}) {
   const clock = { now: opts.now || Date.parse('2026-10-20T02:00:00Z'), perf: 1000 };
   const store = opts.storage instanceof Map ? opts.storage : new Map(Object.entries(opts.storage || {}));
@@ -18,13 +20,14 @@ function load(opts = {}) {
     setItem: (k, v) => void store.set(k, String(v)),
     removeItem: (k) => void store.delete(k),
   };
-  const window = { addEventListener() {}, matchMedia: () => ({ matches: false }), fetch: opts.fetch };
+  const window = { addEventListener() {}, matchMedia: () => ({ matches: false }), fetch: opts.fetch, Notification: opts.Notification, focus() {} };
   const document = {
     readyState: 'loading', // DOMContentLoaded 不会来，所以不建 UI
     addEventListener() {},
     body: null,
     documentElement: {},
     visibilityState: 'visible',
+    hidden: false,
     cookie: opts.cookie || '',
   };
   const location = { pathname: opts.path || '/code/session_0123456789abcdefghij' };
@@ -74,7 +77,23 @@ function load(opts = {}) {
       location.pathname = path;
       history.pushState({}, '', path);
     },
+    setHidden(on) {
+      document.hidden = on;
+      document.visibilityState = on ? 'hidden' : 'visible';
+    },
   };
+}
+
+// 浏览器通知的替身：发出的通知记在 sent 里（[标题, { body, tag }]）。几个标签页可以共用一个
+function fakeNotification(permission = 'granted') {
+  const N = function (title, o) {
+    N.sent.push([title, o]);
+    this.close = () => {};
+  };
+  N.permission = permission;
+  N.sent = [];
+  N.requestPermission = () => Promise.resolve(N.permission);
+  return N;
 }
 
 // ---------------------------------------------------------------- 事件构造：Claude Code stream-json 的形状
@@ -116,8 +135,8 @@ function assistant(id, { model = 'claude-opus-5-5', input = 5, cacheRead = 0, ca
 }
 
 // result：modelUsage / total_cost_usd 是这段运行的累计值。usage 是 { 模型: { input, output, cacheRead, cacheWrite, cost } }；
-// sid 是 CLI 的会话 id（真实的 result 里有 session_id）
-function result(usage, { apiMs = 0, wallMs = 0, timestamp, turn, sid } = {}) {
+// sid 是 CLI 的会话 id（真实的 result 里有 session_id），requests 是这一轮的请求数（num_turns）
+function result(usage, { apiMs = 0, wallMs = 0, timestamp, turn, sid, requests } = {}) {
   const modelUsage = {};
   let cost = 0;
   for (const [model, u] of Object.entries(usage)) {
@@ -136,6 +155,7 @@ function result(usage, { apiMs = 0, wallMs = 0, timestamp, turn, sid } = {}) {
     subtype: 'success',
     uuid: uid('r'),
     ...(sid ? { session_id: sid } : {}),
+    ...(requests ? { num_turns: requests } : {}),
     ...(timestamp ? { timestamp: new Date(timestamp).toISOString() } : {}),
     total_cost_usd: cost,
     duration_api_ms: apiMs,
@@ -158,4 +178,4 @@ const rateLimit = (windows) => ({
 const usageApi = (windows) =>
   Object.fromEntries(Object.entries(windows).map(([name, [percent, resetsAtMs]]) => [name, { utilization: percent, resets_at: new Date(resetsAtMs).toISOString() }]));
 
-module.exports = { load, streamEvent, messageStart, blockStart, textDelta, messageDelta, messageStop, assistant, result, rateLimit, usageApi };
+module.exports = { load, fakeNotification, streamEvent, messageStart, blockStart, textDelta, messageDelta, messageStop, assistant, result, rateLimit, usageApi };
