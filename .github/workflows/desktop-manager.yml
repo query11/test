@@ -11,10 +11,10 @@ on:
       - '.github/workflows/desktop-manager.yml'
   workflow_dispatch:
     inputs:
-      dump_screenshots:
-        description: 'Screenshots to print into the log as base64 JPEG, e.g. tab0,tab1'
-        type: string
-        default: ''
+      commit_screenshots:
+        description: 'Commit the screenshots (demo data) to desktop-manager/docs/ on this branch'
+        type: boolean
+        default: false
 
 jobs:
   linux:
@@ -67,33 +67,6 @@ jobs:
           $dir = Join-Path $env:RUNNER_TEMP 'screenshots'
           $p = Start-Process desktop-manager/src/bin/Release/net48/ClaudeDesktopManager.exe -ArgumentList '--demo', '--screenshot', $dir -Wait -PassThru
           Get-ChildItem $dir
-      - name: Print screenshots into the log
-        if: ${{ always() && inputs.dump_screenshots != '' }}
-        shell: powershell
-        env:
-          SHOTS: ${{ inputs.dump_screenshots }}
-        run: |
-          # Artifacts are not reachable from every place that reads these results; the log is.
-          Add-Type -AssemblyName System.Drawing
-          $jpeg = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
-          $q = New-Object System.Drawing.Imaging.EncoderParameters 1
-          $q.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality, [long]60)
-          foreach ($name in $env:SHOTS.Split(',')) {
-            $path = Join-Path (Join-Path $env:RUNNER_TEMP 'screenshots') ($name.Trim() + '.png')
-            if (-not (Test-Path $path)) { continue }
-            $img = [System.Drawing.Image]::FromFile($path)
-            $small = New-Object System.Drawing.Bitmap ([int]($img.Width * 0.8)), ([int]($img.Height * 0.8))
-            $g = [System.Drawing.Graphics]::FromImage($small)
-            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-            $g.DrawImage($img, 0, 0, $small.Width, $small.Height)
-            $g.Dispose()
-            $img.Dispose()
-            $ms = New-Object System.IO.MemoryStream
-            $small.Save($ms, $jpeg, $q)
-            $small.Dispose()
-            $b64 = [Convert]::ToBase64String($ms.ToArray())
-            for ($i = 0; $i -lt $b64.Length; $i += 3000) { 'IMG ' + $name.Trim() + ' ' + $b64.Substring($i, [Math]::Min(3000, $b64.Length - $i)) }
-          }
       - uses: actions/upload-artifact@v4
         with:
           name: ClaudeDesktopManager
@@ -103,3 +76,26 @@ jobs:
         with:
           name: screenshots
           path: ${{ runner.temp }}/screenshots
+
+  # Manual runs only: keeps the README screenshots in step with the real Windows rendering.
+  screenshots:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_screenshots }}
+    needs: windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: screenshots
+          path: desktop-manager/docs
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add desktop-manager/docs
+          if git diff --cached --quiet; then echo 'screenshots unchanged'; exit 0; fi
+          git commit -m 'Update desktop-manager screenshots'
+          git push
