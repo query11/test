@@ -1,0 +1,68 @@
+name: desktop-manager
+
+on:
+  push:
+    paths:
+      - 'desktop-manager/**'
+      - '.github/workflows/desktop-manager.yml'
+  pull_request:
+    paths:
+      - 'desktop-manager/**'
+      - '.github/workflows/desktop-manager.yml'
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Unit tests
+        run: dotnet run -c Release --project desktop-manager/tests
+      - name: Build the Windows exe on Linux
+        run: dotnet build -c Release desktop-manager/src
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Unit tests
+        run: dotnet run -c Release --project desktop-manager/tests
+      - name: Build
+        run: |
+          dotnet build -c Release desktop-manager/src
+          dotnet build -c Release desktop-manager/tests/FakeClaude
+      - name: Self test against the real Windows APIs
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'selftest.txt'
+          $p = Start-Process desktop-manager/src/bin/Release/net48/ClaudeDesktopManager.exe -ArgumentList 'selftest', '--out', $out -Wait -PassThru
+          Get-Content $out -Encoding UTF8
+          exit $p.ExitCode
+      - name: End-to-end test with a fake Claude.exe
+        shell: pwsh
+        run: >
+          ./desktop-manager/tests/e2e.ps1
+          -Manager (Resolve-Path desktop-manager/src/bin/Release/net48/ClaudeDesktopManager.exe)
+          -Fake (Resolve-Path desktop-manager/tests/FakeClaude/bin/Release/net48/FakeClaude.exe)
+      - name: Screenshots of every tab (demo data)
+        if: always()
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'screenshots'
+          $p = Start-Process desktop-manager/src/bin/Release/net48/ClaudeDesktopManager.exe -ArgumentList '--demo', '--screenshot', $dir -Wait -PassThru
+          Get-ChildItem $dir
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeDesktopManager
+          path: desktop-manager/src/bin/Release/net48/ClaudeDesktopManager.exe
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: ${{ runner.temp }}/screenshots

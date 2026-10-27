@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Runs the platform-independent part (src/Core) on any OS: dotnet run -c Release -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>ClaudeDesktopManager.Tests</RootNamespace>
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../src/Core/**/*.cs" LinkBase="Core" />
+    <!-- Separate Windows-only project used by e2e.ps1 -->
+    <Compile Remove="FakeClaude/**" />
+  </ItemGroup>
+</Project>
