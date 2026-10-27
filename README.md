@@ -4,6 +4,8 @@
 
 **[点这里安装](https://raw.githubusercontent.com/query11/test/HEAD/claude-token-meter.user.js)**（需要先装好 Tampermonkey 或 Violentmonkey，见[安装](#安装)）
 
+> 仓库里还有一个 Windows 小工具：[Claude Desktop 管理器](desktop-manager/README.md)，一键启动 / 关闭 Claude Desktop（连同残留进程），按方案设置代理和时区。
+
 ![面板截图](shot.png)
 
 默认是右下角的一行摘要，例如：

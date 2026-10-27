@@ -372,22 +372,50 @@ namespace ClaudeDesktopManager
             }
 
             if (!File.Exists(install.ExePath)) return new LaunchResult { Error = "找不到 " + install.ExePath };
-            var psi = new ProcessStartInfo(install.ExePath, spec.ArgString)
+            return StartDetached(install.ExePath, spec.ArgString, spec.Env);
+        }
+
+        /// <summary>
+        /// CreateProcess outside any job object this tool runs in, when the job allows it, so that
+        /// Claude does not end (or keep a waiting script waiting) along with whatever started us.
+        /// </summary>
+        static LaunchResult StartDetached(string exe, string args, IDictionary<string, string> envChanges)
+        {
+            var vars = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables())
+                vars[(string)e.Key] = (string)e.Value;
+            foreach (var kv in envChanges)
             {
-                UseShellExecute = false,
-                WorkingDirectory = Path.GetDirectoryName(install.ExePath),
-            };
-            foreach (var kv in spec.Env)
-            {
-                if (kv.Value.Length == 0) psi.Environment.Remove(kv.Key);
-                else psi.Environment[kv.Key] = kv.Value;
+                if (kv.Value.Length == 0) vars.Remove(kv.Key);
+                else vars[kv.Key] = kv.Value;
             }
+            var block = new StringBuilder();
+            foreach (var kv in vars) block.Append(kv.Key).Append('=').Append(kv.Value).Append('\0');
+            block.Append('\0');
+
+            IntPtr env = Marshal.StringToHGlobalUni(block.ToString());
             try
             {
-                using (var p = Process.Start(psi))
-                    return new LaunchResult { Ok = true, Pid = p?.Id ?? 0, Method = "直接启动" };
+                uint flags = Native.CREATE_UNICODE_ENVIRONMENT | Native.CREATE_DEFAULT_ERROR_MODE;
+                var dir = Path.GetDirectoryName(exe);
+                foreach (var extra in new[] { Native.CREATE_BREAKAWAY_FROM_JOB, 0u })
+                {
+                    var si = new Native.STARTUPINFOW { cb = Marshal.SizeOf(typeof(Native.STARTUPINFOW)) };
+                    var cmd = new StringBuilder(CommandLine.Quote(exe) + (args.Length > 0 ? " " + args : ""), 32768);
+                    if (Native.CreateProcessW(exe, cmd, IntPtr.Zero, IntPtr.Zero, false, flags | extra, env, dir, ref si, out var pi))
+                    {
+                        Native.CloseHandle(pi.hThread);
+                        Native.CloseHandle(pi.hProcess);
+                        return new LaunchResult { Ok = true, Pid = pi.dwProcessId, Method = "直接启动" };
+                    }
+                    int code = Marshal.GetLastWin32Error();
+                    // ERROR_ACCESS_DENIED: the job does not allow breaking away; start inside it.
+                    if (extra == 0 || code != Native.ERROR_ACCESS_DENIED)
+                        return new LaunchResult { Error = new Win32Exception(code).Message };
+                }
+                return new LaunchResult { Error = "CreateProcess 失败" };
             }
-            catch (Exception e) { return new LaunchResult { Error = e.Message }; }
+            finally { Marshal.FreeHGlobal(env); }
         }
 
         // ------------------------------------------------------------ services

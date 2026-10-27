@@ -257,6 +257,19 @@ localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-his
 - 推送前跑 `node --test`。新逻辑配用例，并用 `CTM_SCRIPT` 确认用例在旧版本上会失败。
 - 推送到默认分支（让用户收到更新）之前先问用户。
 
+## desktop-manager（2026-10-27 新增）
+
+和油猴脚本无关的另一个项目：Windows 上的 Claude Desktop 管理器，代码和说明都在 `desktop-manager/`（README 是面向用户的说明，“开发”一节有目录结构）。用户的原话：“开启 claude desktop 和一键关闭 claude desktop 所有的进程”“设置 desktop 读取到的本机时间（时区）”“管理他的网络出口……有时候我可能会用代理”，其他功能由我们定。用户用的是 Windows。
+
+- C# WinForms，.NET Framework 4.8（Windows 10/11 自带，单个 exe）。`src/Core` 不依赖 Windows，`tests/` 用 net8 编译这些文件，在 Linux 上也能跑：`dotnet run -c Release --project desktop-manager/tests`。`src` 也能在 Linux 上编译（引用 Microsoft.NETFramework.ReferenceAssemblies）。
+- 界面可以在 Linux 上用 Mono 看：`xvfb-run mono ClaudeDesktopManager.exe --demo --tab N --size 960x1400`（假数据，`DemoPlatform`）。
+- CI `.github/workflows/desktop-manager.yml`：Windows 上跑 `selftest`（真实的 Win32 调用）、`tests/e2e.ps1`（用 `tests/FakeClaude` 冒充旧版安装的 Claude.exe，走启动 → 关闭 → 启动 → 强制结束），截图和 exe 作为制品上传。用户从 Actions 的制品下载 exe。
+- 关键决定：
+  - 进程按路径认（`WindowsApps\Claude_…`、`Packages\Claude_…`、`%LOCALAPPDATA%\AnthropicClaude`、`%APPDATA%\Claude`、`Claude-3p`），不按文件名，免得误杀终端里的 Claude Code。子进程只结束命令行程序（读 PE 头的 Subsystem），窗口程序保留；父 PID 要比创建时间，防 PID 复用；结束后再扫几轮，处理自动重启。
+  - Windows 上没法给单个程序换时区（ICU 在 Windows 上不看 `TZ`），所以是临时切系统时区（tzutil），Claude 退出后恢复；原时区先写进设置文件。CLI 和托盘里的实例共用设置文件，`SettingsStore.SyncState()` 每次刷新时同步这部分状态。
+  - 代理三种方式：Chromium 启动参数、官方的 `egressProxyUrl` 策略（HKCU\SOFTWARE\Policies\Claude，普通用户写不了，用 `--elevated-policy` 以管理员身份启动自己写入 `HKU\<SID>`）、环境变量（只对 Squirrel 安装；MSIX 通过 `IApplicationActivationManager` 激活，只能带参数）。
+- 没在真的 Claude Desktop 上验证过的（CI 上没有 Claude）：MSIX 激活时参数是否原样传到 Claude.exe（启动后会读主进程命令行检查并提示）、`egressProxyUrl` 在 claude.ai 登录的普通模式下是否生效（看 `main.log` 的 `[egress-proxy]`）、Claude 关窗口时是退出还是缩到托盘（“关闭”先发 WM_CLOSE，等不到就强制结束）。用户实际用过后按反馈调整。
+
 ## 新窗口的开场提示（可以直接粘贴）
 
 > 读一下仓库根目录的 HANDOFF.md，基于默认分支继续。看看待办里有没有值得做的，先跟我说你打算做什么。

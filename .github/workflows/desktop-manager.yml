@@ -14,6 +14,7 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -26,6 +27,7 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -38,6 +40,7 @@ jobs:
           dotnet build -c Release desktop-manager/src
           dotnet build -c Release desktop-manager/tests/FakeClaude
       - name: Self test against the real Windows APIs
+        timeout-minutes: 3
         shell: pwsh
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'selftest.txt'
@@ -45,6 +48,7 @@ jobs:
           Get-Content $out -Encoding UTF8
           exit $p.ExitCode
       - name: End-to-end test with a fake Claude.exe
+        timeout-minutes: 8
         shell: pwsh
         run: >
           ./desktop-manager/tests/e2e.ps1
@@ -52,6 +56,7 @@ jobs:
           -Fake (Resolve-Path desktop-manager/tests/FakeClaude/bin/Release/net48/FakeClaude.exe)
       - name: Screenshots of every tab (demo data)
         if: always()
+        timeout-minutes: 3
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'screenshots'
