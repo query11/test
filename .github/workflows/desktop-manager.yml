@@ -10,6 +10,11 @@ on:
       - 'desktop-manager/**'
       - '.github/workflows/desktop-manager.yml'
   workflow_dispatch:
+    inputs:
+      dump_screenshots:
+        description: 'Also print the screenshots into the log (base64 JPEG)'
+        type: boolean
+        default: false
 
 jobs:
   linux:
@@ -62,6 +67,22 @@ jobs:
           $dir = Join-Path $env:RUNNER_TEMP 'screenshots'
           $p = Start-Process desktop-manager/src/bin/Release/net48/ClaudeDesktopManager.exe -ArgumentList '--demo', '--screenshot', $dir -Wait -PassThru
           Get-ChildItem $dir
+      - name: Print screenshots into the log
+        if: ${{ always() && inputs.dump_screenshots }}
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $jpeg = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+          $q = New-Object System.Drawing.Imaging.EncoderParameters 1
+          $q.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality, [long]80)
+          foreach ($f in Get-ChildItem (Join-Path $env:RUNNER_TEMP 'screenshots') -Filter *.png) {
+            $img = [System.Drawing.Image]::FromFile($f.FullName)
+            $ms = New-Object System.IO.MemoryStream
+            $img.Save($ms, $jpeg, $q)
+            $img.Dispose()
+            $b64 = [Convert]::ToBase64String($ms.ToArray())
+            for ($i = 0; $i -lt $b64.Length; $i += 3000) { 'IMG ' + $f.BaseName + ' ' + $b64.Substring($i, [Math]::Min(3000, $b64.Length - $i)) }
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: ClaudeDesktopManager

@@ -7,6 +7,24 @@ using System.Text;
 
 namespace ClaudeDesktopManager
 {
+    /// <summary>Timing output for `--trace` (command line); does nothing unless a sink is set.</summary>
+    public static class Diag
+    {
+        public static Action<string> Sink;
+
+        public static IDisposable Time(string what) => Sink == null ? null : new Timer(what);
+
+        sealed class Timer : IDisposable
+        {
+            readonly string what;
+            readonly System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+
+            public Timer(string what) { this.what = what; }
+
+            public void Dispose() => Sink?.Invoke(what + " " + sw.ElapsedMilliseconds + " ms");
+        }
+    }
+
     public static class Fmt
     {
         public static string Bytes(long b)

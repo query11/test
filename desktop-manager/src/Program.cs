@@ -153,14 +153,17 @@ namespace ClaudeDesktopManager
                 if (console || !Program.IsWindows) Console.WriteLine(line);
             };
             if (console) Console.WriteLine();
+            if (args.Contains("--trace")) Diag.Sink = s => print("[trace] " + s);
 
             int code;
+            var total = System.Diagnostics.Stopwatch.StartNew();
             try { code = Execute(m, command, args, print); }
             catch (Exception e)
             {
                 print("出错：" + e.Message);
                 code = 1;
             }
+            Diag.Sink?.Invoke("合计 " + total.ElapsedMilliseconds + " ms");
 
             if (outFile != null)
             {

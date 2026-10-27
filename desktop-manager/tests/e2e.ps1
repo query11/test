@@ -14,7 +14,7 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
 function Run-Manager([string[]]$cmd) {
     $out = Join-Path $env:TEMP ('cdm-' + [guid]::NewGuid().ToString('N') + '.txt')
     # Not -Wait: that also waits for every process the manager starts, i.e. for Claude itself.
-    $p = Start-Process -FilePath $Manager -ArgumentList ($cmd + @('--out', $out)) -PassThru
+    $p = Start-Process -FilePath $Manager -ArgumentList ($cmd + @('--out', $out, '--trace')) -PassThru
     $null = $p.Handle  # keeps ExitCode readable after the process is gone
     if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force; throw "manager $($cmd -join ' ') did not finish in 2 minutes" }
     $text = if (Test-Path $out) { Get-Content $out -Raw -Encoding UTF8 } else { '' }

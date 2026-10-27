@@ -114,7 +114,11 @@ namespace ClaudeDesktopManager
         public ClaudeInstall RefreshInstall(ProcessView running = null)
         {
             var list = new List<ClaudeInstall>();
-            try { list = P.DetectInstalls() ?? list; }
+            try
+            {
+                using (Diag.Time("检测安装"))
+                    list = P.DetectInstalls() ?? list;
+            }
             catch (Exception e) { Log(LogLevel.Warn, "检测安装位置时出错：" + e.Message); }
 
             var custom = (S.Options.CustomExePath ?? "").Trim();
@@ -164,7 +168,9 @@ namespace ClaudeDesktopManager
 
         public ProcessView Scan(IDictionary<int, long> extraParents = null)
         {
-            var snap = P.Snapshot(Dirs);
+            List<ProcInfo> snap;
+            using (Diag.Time("扫描进程"))
+                snap = P.Snapshot(Dirs);
             return ProcessPlanner.Plan(snap, Dirs, new KillOptions
             {
                 KillDescendants = S.Options.KillDescendants,
@@ -272,14 +278,18 @@ namespace ClaudeDesktopManager
             ApplyTimeZoneCore(r, profile);
             EnsureServiceStartable(r);
 
-            var result = P.Launch(install, spec);
+            LaunchResult result;
+            using (Diag.Time("启动进程"))
+                result = P.Launch(install, spec);
             if (!result.Ok)
             {
                 Report(r, LogLevel.Error, "启动 Claude 失败：" + result.Error);
                 return;
             }
 
-            var main = WaitForMain(result.Pid);
+            ProcInfo main;
+            using (Diag.Time("等待主进程"))
+                main = WaitForMain(result.Pid);
             if (main == null)
             {
                 Report(r, LogLevel.Warn, "已发出启动请求（" + result.Method + "），但 " + (LaunchWaitMs / 1000) + " 秒内没看到 Claude 主进程，请稍后看一下状态");
@@ -362,6 +372,7 @@ namespace ClaudeDesktopManager
             else
             {
                 if (!force && opt.GracefulTimeoutSec > 0 && view.Mains.Count > 0)
+                using (Diag.Time("等待正常退出"))
                 {
                     int windows = 0;
                     foreach (var m in view.Mains) windows += P.CloseWindows(m.Pid);

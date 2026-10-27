@@ -44,38 +44,51 @@ namespace ClaudeDesktopManager
             return list;
         }
 
+        // Get-AppxPackage takes seconds; ask it at most once per run, and only when the registry has no answer.
+        static List<KeyValuePair<string, string>> appxCache;
+
         List<ClaudeInstall> DetectMsix()
         {
             var packages = new List<KeyValuePair<string, string>>();
+            bool repositoryListed = false;
             try
             {
                 using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"))
                 {
-                    if (k != null)
-                        foreach (var name in k.GetSubKeyNames())
+                    var names = k?.GetSubKeyNames() ?? new string[0];
+                    // Every Windows 10/11 user has dozens of packages registered (Calculator, Store…), so an
+                    // empty list means the key cannot be relied on.
+                    repositoryListed = names.Length > 0;
+                    foreach (var name in names)
+                    {
+                        if (!IsClaudePackage(name)) continue;
+                        using (var sub = k.OpenSubKey(name))
                         {
-                            if (!IsClaudePackage(name)) continue;
-                            using (var sub = k.OpenSubKey(name))
-                            {
-                                if (sub?.GetValue("PackageRootFolder") is string root && Directory.Exists(root))
-                                    packages.Add(new KeyValuePair<string, string>(name, root));
-                            }
+                            if (sub?.GetValue("PackageRootFolder") is string root && Directory.Exists(root))
+                                packages.Add(new KeyValuePair<string, string>(name, root));
                         }
+                    }
                 }
             }
             catch (Exception e) when (e is IOException || e is UnauthorizedAccessException || e is System.Security.SecurityException) { }
 
-            if (packages.Count == 0)
+            if (packages.Count == 0 && !repositoryListed)
             {
-                var r = RunPowerShell(
-                    "Get-AppxPackage | Where-Object { $_.Name -match '^(Claude|Anthropic\\.Claude(Desktop)?)$' } | ForEach-Object { $_.PackageFullName + '|' + $_.InstallLocation }",
-                    20000);
-                foreach (var line in r.Output.Split('\n'))
+                if (appxCache == null)
                 {
-                    var parts = line.Trim().Split('|');
-                    if (parts.Length == 2 && IsClaudePackage(parts[0]) && parts[1].Length > 0)
-                        packages.Add(new KeyValuePair<string, string>(parts[0], parts[1]));
+                    var found = new List<KeyValuePair<string, string>>();
+                    var r = RunPowerShell(
+                        "Get-AppxPackage | Where-Object { $_.Name -match '^(Claude|Anthropic\\.Claude(Desktop)?)$' } | ForEach-Object { $_.PackageFullName + '|' + $_.InstallLocation }",
+                        20000);
+                    foreach (var line in r.Output.Split('\n'))
+                    {
+                        var parts = line.Trim().Split('|');
+                        if (parts.Length == 2 && IsClaudePackage(parts[0]) && parts[1].Length > 0)
+                            found.Add(new KeyValuePair<string, string>(parts[0], parts[1]));
+                    }
+                    appxCache = found;
                 }
+                packages.AddRange(appxCache);
             }
 
             // One install per package family: the newest version.
@@ -718,6 +731,12 @@ namespace ClaudeDesktopManager
         // ------------------------------------------------------------ helpers
 
         public CommandResult RunPowerShell(string script, int timeoutMs)
+        {
+            using (Diag.Time("PowerShell"))
+                return RunPowerShellCore(script, timeoutMs);
+        }
+
+        CommandResult RunPowerShellCore(string script, int timeoutMs)
         {
             var full = "$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.Encoding]::UTF8;" + script;
             var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(full));

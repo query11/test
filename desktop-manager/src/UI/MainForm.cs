@@ -449,6 +449,8 @@ namespace ClaudeDesktopManager
             m.S.SelectedProfile = (string)profileCombo.SelectedItem;
             m.SaveSettings();
             LoadProfileIntoTabs();
+            RebuildTrayProfiles();
+            if (lastView != null) UpdateTray(lastView);
         }
 
         void LoadProfileIntoTabs()
