@@ -117,14 +117,17 @@ namespace ClaudeDesktopManager
             return new NumericUpDown { Minimum = min, Maximum = max, Value = Math.Max(min, Math.Min(max, value)), Width = S(width), Margin = new Padding(S(3), S(3), S(3), S(3)) };
         }
 
-        /// <summary>Controls side by side, wrapping when the window is narrow.</summary>
+        /// <summary>
+        /// Controls side by side. No wrapping: tab pages not shown yet are first laid out at a tiny
+        /// width, and a wrapped row keeps that height on Windows. Every row fits the minimum window width.
+        /// </summary>
         public static FlowLayoutPanel Row(params Control[] items)
         {
             var p = new FlowLayoutPanel
             {
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                WrapContents = true,
+                WrapContents = false,
                 FlowDirection = FlowDirection.LeftToRight,
                 Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top,
                 Margin = new Padding(0),

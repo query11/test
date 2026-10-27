@@ -268,6 +268,7 @@ localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-his
   - 进程按路径认（`WindowsApps\Claude_…`、`Packages\Claude_…`、`%LOCALAPPDATA%\AnthropicClaude`、`%APPDATA%\Claude`、`Claude-3p`），不按文件名，免得误杀终端里的 Claude Code。子进程只结束命令行程序（读 PE 头的 Subsystem），窗口程序保留；父 PID 要比创建时间，防 PID 复用；结束后再扫几轮，处理自动重启。
   - Windows 上没法给单个程序换时区（ICU 在 Windows 上不看 `TZ`），所以是临时切系统时区（tzutil），Claude 退出后恢复；原时区先写进设置文件。CLI 和托盘里的实例共用设置文件，`SettingsStore.SyncState()` 每次刷新时同步这部分状态。
   - 代理三种方式：Chromium 启动参数、官方的 `egressProxyUrl` 策略（HKCU\SOFTWARE\Policies\Claude，普通用户写不了，用 `--elevated-policy` 以管理员身份启动自己写入 `HKU\<SID>`）、环境变量（只对 Squirrel 安装；MSIX 通过 `IApplicationActivationManager` 激活，只能带参数）。
+- CI 里的 Windows 截图：Actions 制品和日志下载地址（blob.core.windows.net）在 Claude 的云端环境里访问不了，所以手动运行工作流并勾选 `commit_screenshots`，由 CI 把截图提交到 `desktop-manager/docs/`，再 `git pull`。命令行的 `--trace` 打印各步耗时，e2e 用它（之前每条命令 13–23 秒，原因是检测安装时每次都调 `Get-AppxPackage`，已改成注册表里有包列表时不调）。
 - 没在真的 Claude Desktop 上验证过的（CI 上没有 Claude）：MSIX 激活时参数是否原样传到 Claude.exe（启动后会读主进程命令行检查并提示）、`egressProxyUrl` 在 claude.ai 登录的普通模式下是否生效（看 `main.log` 的 `[egress-proxy]`）、Claude 关窗口时是退出还是缩到托盘（“关闭”先发 WM_CLOSE，等不到就强制结束）。用户实际用过后按反馈调整。
 
 ## 新窗口的开场提示（可以直接粘贴）

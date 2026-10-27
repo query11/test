@@ -5,6 +5,8 @@
 - 单个 exe，不用安装：Windows 10（1903 以后）和 Windows 11 自带它需要的 .NET Framework 4.8。
 - 非官方工具，与 Anthropic 无关。只调用 Windows 和 Claude Desktop 本身提供的功能，不修改 Claude 的程序文件。
 
+![主窗口：进程页](docs/tab0.png)
+
 
 ## 下载和运行
 
@@ -139,4 +141,6 @@ desktop-manager/
                   e2e.ps1（Windows 上用假的 Claude.exe 做端到端测试）
 ```
 
-CI（`.github/workflows/desktop-manager.yml`）在 Linux 和 Windows 上跑单元测试；在 Windows 上还会运行 `ClaudeDesktopManager.exe selftest` 检查各项 Windows 调用，用一个假的 Claude.exe 走一遍“启动 → 状态 → 关闭 → 启动 → 强制结束”，检查参数、环境变量、时区切换和恢复、哪些进程被结束或保留，并截取每一页的截图。
+命令行加 `--trace` 会打印检测安装、扫描进程、启动、等待各用了多少毫秒。
+
+CI（`.github/workflows/desktop-manager.yml`）在 Linux 和 Windows 上跑单元测试；在 Windows 上还会运行 `ClaudeDesktopManager.exe selftest` 检查各项 Windows 调用，用一个假的 Claude.exe 走一遍“启动 → 状态 → 关闭 → 启动 → 强制结束”，检查参数、环境变量、时区切换和恢复、哪些进程被结束或保留，并截取每一页的截图。在 Actions 页面手动运行这个工作流并勾选 `commit_screenshots`，会把这些截图提交到 `desktop-manager/docs/`（README 里的图就是这样来的）。
