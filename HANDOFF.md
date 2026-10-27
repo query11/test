@@ -273,7 +273,10 @@ localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-his
   - 地址：`https://claude.ai/api/desktop/win32/{x64|arm64}/msix/latest/redirect` → 307 → `https://downloads.claude.ai/releases/win32/x64/<版本>/Claude-<hash>.msix`。官网页面上的 `…/setup/latest/redirect`（ClaudeSetup.exe）会被 Cloudflare 的浏览器验证挡住，所以用 MSIX 地址；遇到验证页（`cf-mitigated: challenge` 或 “Just a moment”）就提示用浏览器下载、再“从本地安装包安装”。
   - 检查：清单的 Name 是 Claude，Publisher 的发布者 ID 是 `pzs8sxrjxfjjc` 或 O/CN 是 `Anthropic, PBC`；`Get-AuthenticodeSignature` 有效且签名者是 Anthropic；安装时在管理员进程里再查一遍。安装包里有 Cowork 服务，普通用户 `Add-AppxPackage` 会失败（0x80073D28），所以以管理员身份运行 PowerShell（脚本走 `-EncodedCommand`，不落地），标准用户账户直接提示用官网 ClaudeSetup.exe。
   - Claude 的云端环境访问不了 `downloads.claude.ai`（出口策略 403），真实下载只能在 CI 上测：手动运行工作流并勾选 `real_claude`，跑 `tests/real-claude.ps1`（下载、安装、启动、关闭、强制结束）。
-- 没在真的 Claude Desktop 上验证过的（CI 上没有 Claude）：MSIX 激活时参数是否原样传到 Claude.exe（启动后会读主进程命令行检查并提示）、`egressProxyUrl` 在 claude.ai 登录的普通模式下是否生效（看 `main.log` 的 `[egress-proxy]`）、Claude 关窗口时是退出还是缩到托盘（“关闭”先发 WM_CLOSE，等不到就强制结束）。用户实际用过后按反馈调整。
+- 在真的 Claude Desktop 3.6556.2 上验证过（CI 的 `real_claude`，Windows 10.0.26100，未登录）：下载 271 MB、清单的发布者（EV 证书，`CN="Anthropic, PBC", O="Anthropic, PBC", …, SERIALNUMBER=4860621, OID…`）、`Get-AuthenticodeSignature` 认 MSIX 签名（约 5 秒）、`Add-AppxPackage` 安装（约 36 秒）、MSIX 激活时参数原样出现在主进程命令行、关闭和强制结束。另外看到的：
+  - Claude 收到 WM_CLOSE 后 10 秒内没退出（像是缩到托盘），所以“关闭”会等满“正常退出”的时间再结束进程。
+  - 结束主进程时冒出两个结束不了（拒绝访问）的 claude.exe，停掉 Cowork 服务后就没了。推测是服务（SYSTEM）启动的：`ProcessIdToSessionId` 对 SYSTEM 进程拿不到会话，未知会话被当成本会话。已改成用 `NtQuerySystemInformation` 一次读出所有进程的会话，并把服务启动的进程归到服务下面；`real-claude.ps1` 会记下关闭期间出现的每个 claude.exe（会话、账户、父进程、路径），看下一次运行的结果确认。
+- 还没验证的：`egressProxyUrl` 在 claude.ai 登录的普通模式下是否生效（看 `main.log` 的 `[egress-proxy]`）、登录后关窗口的行为。用户实际用过后按反馈调整。
 
 ## 新窗口的开场提示（可以直接粘贴）
 

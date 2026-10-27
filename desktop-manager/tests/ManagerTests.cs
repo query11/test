@@ -40,6 +40,21 @@ namespace ClaudeDesktopManager.Tests
         }
 
         [Test]
+        public static void WhatTheServiceStartsStaysWithTheService()
+        {
+            var d = new DemoPlatform();
+            d.SeedRunning();
+            // The service (SYSTEM) starts a helper from the package; its session may read as ours or as unknown.
+            var helper = d.Add(9900, 2950, "claude.exe", DemoPlatform.PackageDir + @"\app\resources\claude.exe", true, session: 1);
+            var grandchild = d.Add(9904, 9900, "claude.exe", DemoPlatform.PackageDir + @"\app\resources\claude.exe", true, session: -1);
+            var v = ProcessPlanner.Plan(d.Snapshot(null), Dirs(d), Opt(d));
+            Assert.False(v.Targets.Any(p => p.Pid == helper.Pid || p.Pid == grandchild.Pid), "不去结束服务的进程");
+            Assert.Seq(new[] { 2950, 9900, 9904 }, v.Services.Select(p => p.Pid));
+            Assert.Equal("Cowork 服务启动的进程", v.Services.Single(p => p.Pid == 9900).Detail);
+            Assert.True(v.Running, "Claude 本身照常");
+        }
+
+        [Test]
         public static void ReusedParentPidIsNotAChild()
         {
             var d = new DemoPlatform();

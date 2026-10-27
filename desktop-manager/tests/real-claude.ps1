@@ -21,6 +21,35 @@ function Run-Manager([string[]]$cmd, [int]$timeoutSec = 120) {
     return [pscustomobject]@{ Code = $p.ExitCode; Text = $text }
 }
 
+# Notes every claude.exe that shows up for a while (owner, session, parent, path), to see what the
+# Cowork service starts while Claude is being closed.
+function Watch-Claude([int]$seconds) {
+    $file = Join-Path $env:TEMP ('watch-' + [guid]::NewGuid().ToString('N') + '.txt')
+    $job = Start-Job -ArgumentList $file, $seconds -ScriptBlock {
+        param($file, $seconds)
+        $seen = @{}
+        $end = (Get-Date).AddSeconds($seconds)
+        while ((Get-Date) -lt $end) {
+            foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='claude.exe'")) {
+                if ($seen.ContainsKey($p.ProcessId)) { continue }
+                $owner = try { $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner; "$($o.Domain)\$($o.User)" } catch { '?' }
+                $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.ParentProcessId)" -ErrorAction SilentlyContinue
+                $seen[$p.ProcessId] = "  $($p.ProcessId) session $($p.SessionId) owner $owner parent $($p.ParentProcessId) $($parent.Name) | $($p.ExecutablePath) | $($p.CommandLine)"
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        @($seen.Values) | Set-Content $file -Encoding UTF8
+    }
+    Start-Sleep -Seconds 2
+    return [pscustomobject]@{ Job = $job; File = $file }
+}
+
+function Show-Watch($w) {
+    Wait-Job $w.Job | Out-Null
+    Write-Host 'claude.exe processes seen:'
+    if (Test-Path $w.File) { Get-Content $w.File -Encoding UTF8 | Write-Host }
+}
+
 function Claude-Processes {
     @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath -match '\\WindowsApps\\Claude_' })
 }
@@ -74,8 +103,11 @@ $r = Run-Manager @('status')
 Check 'status: running' ($r.Text -match '正在运行')
 
 # ---- stop, then start and kill
+$w = Watch-Claude 25
 $r = Run-Manager @('stop') 120
+Show-Watch $w
 Check 'stop: exit code 0' ($r.Code -eq 0)
+Check 'stop: nothing it could not end' ($r.Text -notmatch '没能结束')
 Start-Sleep -Seconds 2
 $left = @(Claude-Processes | Where-Object { $_.Name -ieq 'claude.exe' })
 Check 'stop: no Claude.exe left' ($left.Count -eq 0) "($($left.Count) left)"
@@ -83,8 +115,11 @@ Check 'stop: no Claude.exe left' ($left.Count -eq 0) "($($left.Count) left)"
 $r = Run-Manager @('start') 180
 Check 'start again: exit code 0' ($r.Code -eq 0)
 Start-Sleep -Seconds 5
+$w = Watch-Claude 15
 $r = Run-Manager @('kill') 120
+Show-Watch $w
 Check 'kill: exit code 0' ($r.Code -eq 0)
+Check 'kill: nothing it could not end' ($r.Text -notmatch '没能结束')
 Start-Sleep -Seconds 2
 $left = @(Claude-Processes | Where-Object { $_.Name -ieq 'claude.exe' })
 Check 'kill: no Claude.exe left' ($left.Count -eq 0) "($($left.Count) left)"

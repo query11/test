@@ -94,6 +94,11 @@ namespace ClaudeDesktopManager
         [DllImport("psapi.dll", SetLastError = true)]
         public static extern bool GetProcessMemoryInfo(IntPtr hProcess, out PROCESS_MEMORY_COUNTERS_EX ppsmemCounters, uint cb);
 
+        public const int SystemProcessInformation = 5;
+
+        [DllImport("ntdll.dll")]
+        public static extern int NtQuerySystemInformation(int systemInformationClass, IntPtr systemInformation, int systemInformationLength, out int returnLength);
+
         [DllImport("ntdll.dll")]
         public static extern int NtQueryInformationProcess(IntPtr processHandle, int processInformationClass, IntPtr processInformation, int processInformationLength, out int returnLength);
 

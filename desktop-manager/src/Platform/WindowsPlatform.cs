@@ -236,14 +236,59 @@ namespace ClaudeDesktopManager
                 }
             }
             finally { Native.CloseHandle(snap); }
-            foreach (var p in list) Fill(p);
+            var sessions = SessionsByPid();
+            foreach (var p in list)
+            {
+                if (sessions.TryGetValue(p.Pid, out int session)) p.SessionId = session;
+                Fill(p);
+            }
             return list;
+        }
+
+        /// <summary>
+        /// The session of every process in one call. ProcessIdToSessionId needs access that processes running
+        /// as SYSTEM (the Cowork service and what it starts) do not grant, and an unknown session counts as ours.
+        /// </summary>
+        static Dictionary<int, int> SessionsByPid()
+        {
+            var map = new Dictionary<int, int>();
+            // SYSTEM_PROCESS_INFORMATION: UniqueProcessId and SessionId sit after the 56 reserved bytes, the
+            // image name (UNICODE_STRING) and the base priority.
+            int pidOffset = IntPtr.Size == 8 ? 80 : 68;
+            int sessionOffset = IntPtr.Size == 8 ? 100 : 80;
+            int size = 1 << 20;
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                IntPtr buf = Marshal.AllocHGlobal(size);
+                try
+                {
+                    int status = Native.NtQuerySystemInformation(Native.SystemProcessInformation, buf, size, out int needed);
+                    if (status == Native.STATUS_INFO_LENGTH_MISMATCH)
+                    {
+                        size = Math.Max(size * 2, needed + (1 << 16));
+                        continue;
+                    }
+                    if (status != 0) return map;
+                    long offset = 0;
+                    while (offset + sessionOffset + 4 <= size)
+                    {
+                        var entry = new IntPtr(buf.ToInt64() + offset);
+                        map[(int)Marshal.ReadIntPtr(entry, pidOffset).ToInt64()] = Marshal.ReadInt32(entry, sessionOffset);
+                        int next = Marshal.ReadInt32(entry, 0);
+                        if (next <= 0) break;
+                        offset += next;
+                    }
+                    return map;
+                }
+                finally { Marshal.FreeHGlobal(buf); }
+            }
+            return map;
         }
 
         void Fill(ProcInfo p)
         {
             if (p.Pid == 0 || p.Pid == 4) return;
-            if (Native.ProcessIdToSessionId((uint)p.Pid, out var session)) p.SessionId = (int)session;
+            if (p.SessionId < 0 && Native.ProcessIdToSessionId((uint)p.Pid, out var session)) p.SessionId = (int)session;
             IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION | Native.PROCESS_VM_READ, false, p.Pid);
             if (h == IntPtr.Zero) h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, p.Pid);
             if (h == IntPtr.Zero) return;

@@ -266,6 +266,23 @@ namespace ClaudeDesktopManager
                 list.Add(p);
             }
 
+            // What the Cowork service starts runs under the service's account and ends with the service:
+            // it belongs with the service, not with the processes to end.
+            var serviceTree = new Queue<ProcInfo>(view.Services);
+            while (serviceTree.Count > 0)
+            {
+                var parent = serviceTree.Dequeue();
+                if (!children.TryGetValue(parent.Pid, out var kids)) continue;
+                foreach (var c in kids)
+                {
+                    if (!IsChildOf(c, parent) || !owned.Remove(c)) continue;
+                    c.Role = ProcRole.Service;
+                    c.Detail = "Cowork 服务启动的进程";
+                    view.Services.Add(c);
+                    serviceTree.Enqueue(c);
+                }
+            }
+
             var taken = new HashSet<int>(owned.Select(p => p.Pid));
             var descendants = new List<ProcInfo>();
             var queue = new Queue<ProcInfo>(owned);

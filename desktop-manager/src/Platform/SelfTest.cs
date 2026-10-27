@@ -32,6 +32,9 @@ namespace ClaudeDesktopManager
                 Check("识别为窗口程序", self.IsConsole == false);
                 Check("会话", self.SessionId == P.SessionId, self.SessionId.ToString());
             }
+            // Services run in session 0, and that has to be known even where the process cannot be opened.
+            var services = snap.Where(p => p.Name.Equals("services.exe", StringComparison.OrdinalIgnoreCase)).ToList();
+            Check("系统进程的会话", services.Count > 0 && services.All(p => p.SessionId == 0), string.Join(",", services.Select(p => p.SessionId)));
 
             using (var ping = Process.Start(new ProcessStartInfo("ping.exe", "-n 120 127.0.0.1") { UseShellExecute = false, CreateNoWindow = true }))
             {
