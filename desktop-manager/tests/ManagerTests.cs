@@ -387,6 +387,23 @@ namespace ClaudeDesktopManager.Tests
         }
 
         [Test]
+        public static void StartupLeavesAFreshSwitchAlone()
+        {
+            using (var r = new Rig())
+            {
+                // A command-line start switched the zone a second ago and is about to launch Claude.
+                r.M.S.PendingTz = new PendingTimeZone { OriginalId = "China Standard Time", AppliedId = "Tokyo Standard Time", SetAtUtc = DateTime.UtcNow.AddSeconds(-1) };
+                r.P.SystemTz = "Tokyo Standard Time";
+                r.M.StartupCheck(r.M.Scan());
+                Assert.Equal("Tokyo Standard Time", r.P.SystemTz, "刚切换的不马上恢复");
+
+                // Claude never shows up: restored by the regular ticks instead.
+                for (int i = 0; i < 3; i++) r.M.OnTick(r.M.Scan());
+                Assert.Equal("China Standard Time", r.P.SystemTz);
+            }
+        }
+
+        [Test]
         public static void PolicyIsWrittenAndCleanedUp()
         {
             using (var r = new Rig())

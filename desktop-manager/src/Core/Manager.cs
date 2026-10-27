@@ -207,7 +207,10 @@ namespace ClaudeDesktopManager
         {
             Store.SyncState();
             if (S.PendingTz == null) return;
-            if (view.Running)
+            // Switched moments ago: a start from the command line is probably still on its way to
+            // launching Claude. Leave it to OnTick, which restores once Claude has come and gone.
+            bool justSwitched = UtcNow() - S.PendingTz.SetAtUtc < TimeSpan.FromSeconds(30);
+            if (view.Running || justSwitched)
             {
                 sawRunning = true;
                 Log(LogLevel.Warn, string.Format("系统时区仍是临时设置的 {0}（原为 {1}），Claude 退出后恢复", TzName(S.PendingTz.AppliedId), TzName(S.PendingTz.OriginalId)));
