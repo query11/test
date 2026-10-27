@@ -275,7 +275,7 @@ localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-his
   - Claude 的云端环境访问不了 `downloads.claude.ai`（出口策略 403），真实下载只能在 CI 上测：手动运行工作流并勾选 `real_claude`，跑 `tests/real-claude.ps1`（下载、安装、启动、关闭、强制结束）。
 - 在真的 Claude Desktop 3.6556.2 上验证过（CI 的 `real_claude`，Windows 10.0.26100，未登录）：下载 271 MB、清单的发布者（EV 证书，`CN="Anthropic, PBC", O="Anthropic, PBC", …, SERIALNUMBER=4860621, OID…`）、`Get-AuthenticodeSignature` 认 MSIX 签名（约 5 秒）、`Add-AppxPackage` 安装（约 36 秒）、MSIX 激活时参数原样出现在主进程命令行、关闭和强制结束。另外看到的：
   - Claude 收到 WM_CLOSE 后 10 秒内没退出（像是缩到托盘），所以“关闭”会等满“正常退出”的时间再结束进程。
-  - 结束主进程时冒出两个结束不了（拒绝访问）的 claude.exe，停掉 Cowork 服务后就没了。推测是服务（SYSTEM）启动的：`ProcessIdToSessionId` 对 SYSTEM 进程拿不到会话，未知会话被当成本会话。已改成用 `NtQuerySystemInformation` 一次读出所有进程的会话，并把服务启动的进程归到服务下面；`real-claude.ps1` 会记下关闭期间出现的每个 claude.exe（会话、账户、父进程、路径），看下一次运行的结果确认。
+  - 关闭时报过“有 2 个进程没能结束：claude.exe 拒绝访问”。`real-claude.ps1` 记下的进程（会话、账户、父进程、命令行）表明那是普通的渲染进程，同一账户、同一会话，父进程是主进程：主进程一结束，Chromium 的作业对象就在结束这些子进程，正在退出的进程对 `TerminateProcess` 回“拒绝访问”，直到完全退出。`Terminate` 原来只看一眼（等 0 毫秒）进程退出没有，现在最多等 2 秒。先前猜是 Cowork 服务（SYSTEM）的进程，猜错了，但顺带做的两处改动保留：进程的会话改从 `NtQuerySystemInformation` 一次读出（`ProcessIdToSessionId` 对 SYSTEM 进程拿不到会话），Cowork 服务启动的进程归到服务下面。
 - 还没验证的：`egressProxyUrl` 在 claude.ai 登录的普通模式下是否生效（看 `main.log` 的 `[egress-proxy]`）、登录后关窗口的行为。用户实际用过后按反馈调整。
 
 ## 新窗口的开场提示（可以直接粘贴）

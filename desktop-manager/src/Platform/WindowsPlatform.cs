@@ -394,8 +394,9 @@ namespace ClaudeDesktopManager
                 if (!Native.TerminateProcess(h, 1))
                 {
                     int code = Marshal.GetLastWin32Error();
-                    // Already exiting counts as success.
-                    if (Native.WaitForSingleObject(h, 0) == Native.WAIT_OBJECT_0) return true;
+                    // A process already on its way out refuses with "access denied" until it is gone: Chromium's
+                    // job object ends the helpers along with the main process. Exiting counts as success.
+                    if (Native.WaitForSingleObject(h, 2000) == Native.WAIT_OBJECT_0) return true;
                     error = Win32Message(code);
                     return false;
                 }
