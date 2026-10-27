@@ -30,6 +30,42 @@ namespace ClaudeDesktopManager
         public string LocalAppData => Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         public string RoamingAppData => Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         public string DesktopDir => Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+
+        public string DownloadsDir
+        {
+            get
+            {
+                IntPtr p = IntPtr.Zero;
+                try
+                {
+                    if (Native.SHGetKnownFolderPath(Native.FOLDERID_Downloads, 0, IntPtr.Zero, out p) == 0 && p != IntPtr.Zero)
+                    {
+                        var path = Marshal.PtrToStringUni(p);
+                        if (!string.IsNullOrEmpty(path)) return path;
+                    }
+                }
+                catch (Exception) { }
+                finally
+                {
+                    if (p != IntPtr.Zero) Marshal.FreeCoTaskMem(p);
+                }
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+            }
+        }
+
+        public string NativeArch
+        {
+            get
+            {
+                try
+                {
+                    if (Native.IsWow64Process2(Native.GetCurrentProcess(), out _, out ushort machine))
+                        return machine == Native.IMAGE_FILE_MACHINE_ARM64 ? "arm64" : machine == Native.IMAGE_FILE_MACHINE_I386 ? "x86" : "x64";
+                }
+                catch (EntryPointNotFoundException) { }
+                return Environment.Is64BitOperatingSystem ? "x64" : "x86";
+            }
+        }
         public string SelfExe { get; } = Process.GetCurrentProcess().MainModule.FileName;
         public int SelfPid { get; } = Process.GetCurrentProcess().Id;
         public int SessionId { get; } = Process.GetCurrentProcess().SessionId;
@@ -726,6 +762,104 @@ namespace ClaudeDesktopManager
                 return true;
             }
             catch (Exception e) { error = e.Message; return false; }
+        }
+
+        // ------------------------------------------------------------ installing Claude
+
+        public InstallRights GetInstallRights()
+        {
+            try
+            {
+                using (var id = WindowsIdentity.GetCurrent())
+                {
+                    if (new WindowsPrincipal(id).IsInRole(WindowsBuiltInRole.Administrator)) return InstallRights.Elevated;
+                    if (Native.GetTokenInformation(id.Token, Native.TokenElevationType, out int type, 4, out _) && type == Native.TokenElevationTypeLimited)
+                        return InstallRights.Consent;
+                }
+            }
+            catch (Exception) { return InstallRights.Consent; }
+            return InstallRights.StandardUser;
+        }
+
+        public SignatureInfo CheckSignature(string file)
+        {
+            var info = new SignatureInfo();
+            var r = RunPowerShell(PsScripts.Signature(file), 180000);
+            foreach (var raw in r.Output.Split('\n'))
+            {
+                var line = raw.TrimEnd('\r');
+                if (line.StartsWith("STATUS ", StringComparison.Ordinal)) info.Status = line.Substring(7).Trim();
+                else if (line.StartsWith("SUBJECT ", StringComparison.Ordinal)) info.Subject = line.Substring(8).Trim();
+                else if (line.StartsWith("MESSAGE ", StringComparison.Ordinal)) info.Message = line.Substring(8).Trim();
+            }
+            if (info.Status.Length == 0) info.Message = r.TimedOut ? "校验超时" : Fmt.Shorten(r.Output.Trim(), 300);
+            return info;
+        }
+
+        public CommandResult InstallPackage(string file, int timeoutMs)
+        {
+            // Whatever ends up installed, ask Windows afresh afterwards.
+            appxCache = null;
+            if (!ClaudeRelease.IsPackageFile(file)) return RunInstaller(file, timeoutMs);
+
+            // The script travels on the command line rather than in a file another process could swap.
+            var log = Path.Combine(Path.GetTempPath(), "cdm-install-" + Guid.NewGuid().ToString("N") + ".log");
+            var script = PsScripts.AddPackage(file, log);
+            var args = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+            var r = new CommandResult();
+            try
+            {
+                string error;
+                if (GetInstallRights() == InstallRights.Elevated)
+                {
+                    var run = Run("powershell.exe", args, timeoutMs);
+                    r.ExitCode = run.ExitCode;
+                    r.TimedOut = run.TimedOut;
+                    error = run.Output.Trim();
+                }
+                else if (RunElevated("powershell.exe", args, timeoutMs, out int code, out error)) r.ExitCode = code;
+                else r.TimedOut = error == "等待管理员进程超时";
+                string written = "";
+                try
+                {
+                    if (File.Exists(log)) written = File.ReadAllText(log).Trim();
+                }
+                catch (Exception) { }
+                r.Output = written.Length > 0 ? written : error ?? "";
+            }
+            finally
+            {
+                try { File.Delete(log); } catch (Exception) { }
+            }
+            return r;
+        }
+
+        /// <summary>An installer exe (ClaudeSetup.exe) asks for elevation itself when it needs it.</summary>
+        static CommandResult RunInstaller(string file, int timeoutMs)
+        {
+            var r = new CommandResult();
+            try
+            {
+                using (var p = Process.Start(new ProcessStartInfo(file) { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(file) ?? "" }))
+                {
+                    if (p == null)
+                    {
+                        r.Output = "没能启动安装程序";
+                        return r;
+                    }
+                    if (!p.WaitForExit(timeoutMs))
+                    {
+                        r.TimedOut = true;
+                        r.Output = "安装程序还没结束";
+                        return r;
+                    }
+                    r.ExitCode = p.ExitCode;
+                    if (r.ExitCode != 0) r.Output = "安装程序返回 " + r.ExitCode;
+                }
+            }
+            catch (Win32Exception e) when (e.NativeErrorCode == Native.ERROR_CANCELLED) { r.Output = "已取消管理员授权"; }
+            catch (Exception e) { r.Output = e.Message; }
+            return r;
         }
 
         // ------------------------------------------------------------ helpers

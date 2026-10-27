@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace ClaudeDesktopManager
@@ -44,6 +45,8 @@ namespace ClaudeDesktopManager
         public Func<DateTime> UtcNow = () => DateTime.UtcNow;
         /// <summary>How long to wait for the main window process after launching.</summary>
         public int LaunchWaitMs = 20000;
+        /// <summary>Address of the latest MSIX for an architecture (the tests use a local server).</summary>
+        public Func<string, string> ReleaseUrl = ClaudeRelease.MsixUrl;
 
         public event Action<LogEntry> Logged;
 
@@ -111,7 +114,8 @@ namespace ClaudeDesktopManager
 
         // ---------------------------------------------------------------- install
 
-        public ClaudeInstall RefreshInstall(ProcessView running = null)
+        /// <summary>Looks for Claude Desktop again; <paramref name="quiet"/> leaves problems out of the log (for polling).</summary>
+        public ClaudeInstall RefreshInstall(ProcessView running = null, bool quiet = false)
         {
             var list = new List<ClaudeInstall>();
             try
@@ -119,7 +123,10 @@ namespace ClaudeDesktopManager
                 using (Diag.Time("检测安装"))
                     list = P.DetectInstalls() ?? list;
             }
-            catch (Exception e) { Log(LogLevel.Warn, "检测安装位置时出错：" + e.Message); }
+            catch (Exception e)
+            {
+                if (!quiet) Log(LogLevel.Warn, "检测安装位置时出错：" + e.Message);
+            }
 
             var custom = (S.Options.CustomExePath ?? "").Trim();
             if (custom.Length > 0)
@@ -136,7 +143,7 @@ namespace ClaudeDesktopManager
                         DataDirCandidates = { data },
                     });
                 }
-                else Log(LogLevel.Warn, "自定义的 Claude 路径不存在：" + custom);
+                else if (!quiet) Log(LogLevel.Warn, "自定义的 Claude 路径不存在：" + custom);
             }
 
             ClaudeInstall pick = list.FirstOrDefault(i => i.Kind == InstallKind.Custom);
@@ -676,6 +683,228 @@ namespace ClaudeDesktopManager
             return r;
         }
 
+        // ---------------------------------------------------------------- download and install
+
+        public const string StandardUserNote =
+            "当前 Windows 账户不是管理员。Claude 的安装包里有 Cowork 虚拟机服务，要管理员权限才能装；" +
+            "让别的管理员账户授权的话，Claude 会装进那个账户。可以改用官网的安装程序 ClaudeSetup.exe：" +
+            "它请求管理员权限时点“否”，会改装不带 Cowork 的版本。";
+
+        /// <summary>Ways to reach the download server; the one the selected profile uses comes first.</summary>
+        public List<DownloadRoute> DownloadRoutes()
+        {
+            var routes = new List<DownloadRoute>();
+            void Add(ProxyEndpoint ep, string label)
+            {
+                if (!routes.Any(x => Equals(x.Proxy, ep))) routes.Add(new DownloadRoute { Proxy = ep, Label = label });
+            }
+            void AddProfile(Profile p)
+            {
+                if (p.Proxy.Mode == ProxyMode.Manual && ProxyLogic.Validate(p.Proxy).Count == 0)
+                    Add(ProxyEndpoint.From(p.Proxy), "方案「" + p.Name + "」的代理 " + ProxyEndpoint.From(p.Proxy));
+            }
+            var sys = ProxyEndpoint.FromSystem(P.GetSystemProxy());
+            var current = S.Selected;
+            switch (current?.Proxy.Mode)
+            {
+                case ProxyMode.Manual:
+                    AddProfile(current);
+                    break;
+                case ProxyMode.System:
+                    if (sys != null) Add(sys, "系统代理 " + sys);
+                    else Add(null, "直连（不用代理）");
+                    break;
+                case ProxyMode.Direct:
+                    Add(null, "直连（不用代理）");
+                    break;
+            }
+            foreach (var p in S.Profiles) AddProfile(p);
+            if (sys != null) Add(sys, "系统代理 " + sys);
+            Add(null, "直连（不用代理）");
+            return routes;
+        }
+
+        /// <summary>Downloads the latest official MSIX into <paramref name="dir"/>.</summary>
+        public DownloadResult DownloadLatest(ProxyEndpoint proxy, string dir, Action<DownloadProgress> progress, CancellationToken cancel)
+        {
+            var arch = P.NativeArch;
+            if (arch != "x64" && arch != "arm64")
+            {
+                var no = new DownloadResult { Error = "Claude Desktop 没有 " + arch + " 版 Windows 的安装包（只支持 64 位 Windows）" };
+                Log(LogLevel.Error, no.Error);
+                return no;
+            }
+            Log(LogLevel.Info, "下载 Claude Desktop 最新版（Windows " + arch + "，" + (proxy == null ? "直连" : "经代理 " + proxy) + "）到 " + dir);
+            var d = new Downloader { Proxy = proxy, Progress = progress, Cancel = cancel };
+            DownloadResult r;
+            using (Diag.Time("下载"))
+                r = d.Download(ReleaseUrl(arch), dir, u => ClaudeRelease.FileNameFor(u, arch));
+            if (r.Ok) Log(LogLevel.Ok, (r.Reused ? "这个版本之前已经下载好了：" : r.Resumed ? "下载完成（接着上次的进度）：" : "下载完成：") + r.FilePath + "（" + Fmt.Bytes(r.Bytes) + "）");
+            else if (r.Cancelled) Log(LogLevel.Info, "已取消下载，下载了的部分保留着，下次接着下");
+            else Log(LogLevel.Error, "下载失败（" + r.Stage + "）：" + r.Error + DownloadHint(r));
+            return r;
+        }
+
+        /// <summary>What to try next after a failed download.</summary>
+        public static string DownloadHint(DownloadResult r)
+        {
+            if (r.Ok || r.Cancelled) return "";
+            if (r.Challenge) return "。请用浏览器打开 " + ClaudeRelease.DownloadPage + " 下载，再在“维护”页点“从本地安装包安装…”";
+            if (r.Status == 403 || r.Stage == "连接" || r.Stage == "连接代理" || r.Stage == "代理握手" || r.Stage == "TLS")
+                return "。可以换一条网络线路再试，或者用浏览器从官网下载";
+            return "";
+        }
+
+        /// <summary>
+        /// Checks that the file is an official Claude Desktop installer, closes Claude, installs it and picks up the
+        /// new install. A <paramref name="downloaded"/> file that turns out damaged is deleted, so the next try fetches it again.
+        /// </summary>
+        public OpResult InstallClaude(string file, bool downloaded = false)
+        {
+            var r = new OpResult();
+            lock (opGate)
+            {
+                busy = true;
+                try { InstallCore(r, file, downloaded); }
+                catch (Exception e) { Report(r, LogLevel.Error, "安装失败：" + e.Message); }
+                finally { busy = false; }
+            }
+            return r;
+        }
+
+        void InstallCore(OpResult r, string file, bool downloaded)
+        {
+            if (string.IsNullOrEmpty(file) || !File.Exists(file))
+            {
+                Report(r, LogLevel.Error, "找不到安装包：" + file);
+                return;
+            }
+            var name = Path.GetFileName(file);
+            bool package = ClaudeRelease.IsPackageFile(file);
+            if (!package && !file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                Report(r, LogLevel.Error, "不认识的安装包：" + name + "（要 .msix 或 .exe）");
+                return;
+            }
+            if (package)
+            {
+                var id = PackageIdentity.Read(file, out var error);
+                if (id == null)
+                {
+                    Report(r, LogLevel.Error, name + "：" + error + (downloaded && Discard(file) ? "（已删除，再试一次会重新下载）" : ""));
+                    return;
+                }
+                if (!id.IsClaude)
+                {
+                    Report(r, LogLevel.Error, "这不是 Anthropic 发布的 Claude Desktop 安装包：" + id);
+                    return;
+                }
+                var arch = P.NativeArch;
+                if (id.Architecture.Equals("arm64", StringComparison.OrdinalIgnoreCase) && arch != "arm64")
+                {
+                    Report(r, LogLevel.Error, "这是 ARM64 版的安装包，这台电脑要 " + arch + " 版");
+                    return;
+                }
+                if (P.GetInstallRights() == InstallRights.StandardUser)
+                {
+                    Report(r, LogLevel.Error, StandardUserNote);
+                    return;
+                }
+                Log(LogLevel.Info, "安装包：Claude " + id.Version + (id.Architecture.Length > 0 ? "（" + id.Architecture + "）" : "") + "，发布者 " + id.Publisher);
+            }
+
+            Log(LogLevel.Info, "正在校验 " + name + " 的数字签名…");
+            SignatureInfo sig;
+            using (Diag.Time("校验签名"))
+                sig = P.CheckSignature(file);
+            if (sig.Valid)
+            {
+                if (!ClaudeRelease.IsAnthropicSubject(sig.Subject))
+                {
+                    Report(r, LogLevel.Error, "数字签名不是 Anthropic 的：" + sig.Subject);
+                    return;
+                }
+                Log(LogLevel.Ok, "数字签名有效：Anthropic, PBC");
+            }
+            else if (sig.Bad || !package)
+            {
+                var hint = "";
+                if (sig.Status == "HashMismatch")
+                    hint = downloaded && Discard(file) ? "，文件不完整或被改过，已删除，再试一次会重新下载" : "，文件可能下载得不完整或被改过，请删掉重新下载";
+                Report(r, LogLevel.Error, "数字签名校验没通过（" + sig.Describe() + "）" + hint);
+                return;
+            }
+            else Log(LogLevel.Warn, "安装前没法校验签名（" + sig.Describe() + "），交给 Windows 在安装时校验");
+
+            // An update cannot replace files that are in use.
+            if (Scan().Targets.Count > 0)
+            {
+                Report(r, LogLevel.Info, "先关闭 Claude");
+                StopCore(r, force: false, restoreTz: false);
+                if (Scan().Running)
+                {
+                    Report(r, LogLevel.Error, "Claude 没能完全退出，已取消安装");
+                    return;
+                }
+            }
+            if (package)
+            {
+                var st = P.GetServiceState(CoworkService);
+                if (st == ServiceState.Running || st == ServiceState.StartPending)
+                {
+                    if (P.StopService(CoworkService, 15000, out var err)) Log(LogLevel.Info, "已停止 Cowork 虚拟机服务");
+                    else Log(LogLevel.Warn, "停止 Cowork 虚拟机服务失败（" + err + "），安装时会再试着关闭它");
+                }
+            }
+
+            if (!package) Log(LogLevel.Info, "正在运行 " + name + "，请按它的提示操作…");
+            else if (P.GetInstallRights() == InstallRights.Elevated) Log(LogLevel.Info, "正在安装…");
+            else Log(LogLevel.Info, "正在安装（Windows 会弹出管理员确认，请点“是”）…");
+            CommandResult res;
+            using (Diag.Time("安装"))
+                res = P.InstallPackage(file, (package ? 15 : 30) * 60 * 1000);
+            var output = (res.Output ?? "").Trim();
+            if (package && res.ExitCode != 0)
+            {
+                Report(r, LogLevel.Error, "安装失败：" + InstallFailure(res, output));
+                return;
+            }
+
+            var custom = (S.Options.CustomExePath ?? "").Trim();
+            if (package && custom.Length > 0 && !File.Exists(custom))
+            {
+                S.Options.CustomExePath = "";
+                SaveSettings();
+                Log(LogLevel.Info, "设置里指定的 Claude.exe（" + custom + "）已经不在了，已清除，改用新装的版本");
+            }
+            RefreshInstall();
+            var installed = package ? Installs.FirstOrDefault(i => i.Kind == InstallKind.Msix) : Install;
+            if (installed != null) Report(r, LogLevel.Ok, "Claude Desktop 已安装：" + installed.Summary);
+            else if (!package && res.ExitCode != 0) Report(r, LogLevel.Error, "安装没完成：" + (output.Length > 0 ? output : "安装程序返回 " + res.ExitCode));
+            else Report(r, LogLevel.Warn, "安装已完成，但还没检测到 Claude Desktop；过一会儿重新打开管理器看看");
+        }
+
+        static bool Discard(string file)
+        {
+            try
+            {
+                File.Delete(file);
+                return true;
+            }
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException) { return false; }
+        }
+
+        static string InstallFailure(CommandResult res, string output)
+        {
+            if (res.TimedOut) return "等了很久还没装完，可能卡住了；可以重启电脑后再试";
+            var why = ClaudeRelease.ExplainInstallError(output);
+            var raw = Regex.Replace(output, @"^(ERROR|SIGNATURE|SIGNER) ", "");
+            if (why != null) return why + "。Windows 的原话：" + Fmt.Shorten(raw, 300);
+            if (output.StartsWith("SIGNER ", StringComparison.Ordinal)) return "签名者不是 Anthropic：" + raw;
+            if (output.StartsWith("SIGNATURE ", StringComparison.Ordinal)) return "数字签名校验没通过（" + raw + "）";
+            return raw.Length > 0 ? Fmt.Shorten(raw, 500) : "PowerShell 返回 " + res.ExitCode;
+        }
+
         // ---------------------------------------------------------------- diagnostics
 
         public string Diagnostics()
@@ -699,6 +928,7 @@ namespace ClaudeDesktopManager
                 sb.AppendLine(string.Format("  {0,6} {1,-10} {2,-24} {3,9}  {4}", p.Pid, ProcessPlanner.RoleName(p.Role), p.Name, Fmt.Bytes(p.PrivateBytes),
                     Fmt.Shorten(p.CommandLine ?? p.Path ?? "", 160)));
             sb.AppendLine("Cowork 服务：" + Fmt.Service(P.GetServiceState(CoworkService)));
+            sb.AppendLine("Windows：" + P.NativeArch + "，" + RightsText(P.GetInstallRights()));
             sb.AppendLine();
             sb.AppendLine("系统时区：" + TzName(P.GetSystemTimeZoneId()));
             if (S.PendingTz != null) sb.AppendLine("临时时区：" + S.PendingTz.AppliedId + "，原为 " + S.PendingTz.OriginalId);
@@ -728,6 +958,9 @@ namespace ClaudeDesktopManager
             }
             return sb.ToString();
         }
+
+        public static string RightsText(InstallRights r) =>
+            r == InstallRights.Elevated ? "以管理员身份运行" : r == InstallRights.Consent ? "管理员账户（UAC）" : "标准用户账户";
 
         static string Redact(string key, string value)
         {

@@ -108,6 +108,31 @@ namespace ClaudeDesktopManager
         public bool TimedOut;
     }
 
+    public enum InstallRights
+    {
+        /// <summary>Running elevated, or UAC is off: installs straight away.</summary>
+        Elevated,
+        /// <summary>An administrator under UAC: Windows asks to allow the change.</summary>
+        Consent,
+        /// <summary>A standard account: an administrator's password would install into that administrator's account.</summary>
+        StandardUser,
+    }
+
+    public sealed class SignatureInfo
+    {
+        /// <summary>Get-AuthenticodeSignature's verdict (Valid, NotSigned, HashMismatch, NotTrusted, NotSupportedFileFormat…); empty when it could not run.</summary>
+        public string Status = "";
+        public string Subject = "";
+        public string Message = "";
+
+        public bool Valid => Status == "Valid";
+
+        /// <summary>Tampered with, unsigned, or signed by nobody Windows trusts.</summary>
+        public bool Bad => Status == "NotSigned" || Status == "HashMismatch" || Status == "NotTrusted";
+
+        public string Describe() => Status.Length == 0 ? (Message.Length > 0 ? Message : "没法校验") : Status + (Message.Length > 0 ? "，" + Message : "");
+    }
+
     /// <summary>Everything that touches Windows. WindowsPlatform is the real one, DemoPlatform fakes it.</summary>
     public interface IPlatform
     {
@@ -115,6 +140,9 @@ namespace ClaudeDesktopManager
         string LocalAppData { get; }
         string RoamingAppData { get; }
         string DesktopDir { get; }
+        string DownloadsDir { get; }
+        /// <summary>"x64" or "arm64" ("x86" on 32-bit Windows): which Claude build this machine needs.</summary>
+        string NativeArch { get; }
         /// <summary>Full path of this tool's exe.</summary>
         string SelfExe { get; }
         int SelfPid { get; }
@@ -153,5 +181,13 @@ namespace ClaudeDesktopManager
         bool GetRunAtLogin();
         bool SetRunAtLogin(bool enable, out string error);
         CommandResult RunPowerShell(string script, int timeoutMs);
+
+        InstallRights GetInstallRights();
+        SignatureInfo CheckSignature(string file);
+        /// <summary>
+        /// Installs an MSIX for this user (elevated: the package has a service), or runs an installer exe and
+        /// waits for it. ExitCode 0 is success; Output carries what went wrong.
+        /// </summary>
+        CommandResult InstallPackage(string file, int timeoutMs);
     }
 }

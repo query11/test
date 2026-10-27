@@ -1,6 +1,6 @@
 # Claude Desktop 管理器（Windows）
 
-一个 Windows 小工具：一键启动、关闭 Claude Desktop（连同它留下的所有进程），按“方案”设置 Claude 走的代理和看到的时区，另外还能管理 MCP 服务器、看日志、清缓存、修复卡住的更新。
+一个 Windows 小工具：一键启动、关闭 Claude Desktop（连同它留下的所有进程），按“方案”设置 Claude 走的代理和看到的时区，另外还能下载安装 Claude Desktop（误删了也能装回来）、管理 MCP 服务器、看日志、清缓存、修复卡住的更新。
 
 - 单个 exe，不用安装：Windows 10（1903 以后）和 Windows 11 自带它需要的 .NET Framework 4.8。
 - 非官方工具，与 Anthropic 无关。只调用 Windows 和 Claude Desktop 本身提供的功能，不修改 Claude 的程序文件。
@@ -32,10 +32,30 @@ dotnet build -c Release desktop-manager/src
 | 时区 | 当前方案让 Claude 看到哪个时区，系统时区的状态，恢复按钮 |
 | 启动选项 | 界面语言、禁用 GPU、额外启动参数和环境变量，以及“启动时会做什么”的预览 |
 | MCP 服务器 | `claude_desktop_config.json` 里的服务器列表，停用 / 启用 |
-| 维护 | 打开数据和日志目录、查看日志、磁盘占用、清理缓存、重新注册 MSIX 包、复制诊断信息、创建桌面快捷方式 |
+| 维护 | 打开数据和日志目录、查看日志、磁盘占用、清理缓存、下载安装 / 更新 Claude、重新注册 MSIX 包、复制诊断信息、创建桌面快捷方式 |
 | 设置 | 关闭 Claude 时的行为、托盘、开机启动、手动指定 Claude.exe |
 
 窗口底部是操作记录，每一步做了什么、成功没有都写在这里。
+
+### 下载安装 Claude Desktop
+
+没装 Claude（或者不小心卸载了）时，窗口顶部会出现 **下载安装 Claude…** 按钮；“维护”页里也有 **下载并安装最新版…**，已经装了的可以用它升级。
+
+![下载安装](docs/install.png)
+
+1. **下载**：从 claude.ai 下载官方最新的 MSIX 安装包（和官网下载页给的是同一个文件），存到“下载”文件夹，文件名带版本号，比如 `Claude-3.6556.2-x64.msix`。ARM 版 Windows 会下载 arm64 版。
+2. **网络线路**可以选：当前方案的代理、其他方案里的代理、系统代理或直连，默认跟当前方案一样。连接断了会自动接着下；点了“取消下载”或者关掉窗口，下次再点也从断开的地方继续。
+3. **检查**：安装包的发布者必须是 Anthropic（装上后包名是 `Claude_pzs8sxrjxfjjc`），数字签名必须有效，不对就不装。
+4. **安装**：先关闭正在运行的 Claude 和 Cowork 服务，再用 `Add-AppxPackage` 安装。安装包里带着 Cowork 虚拟机服务，所以 Windows 会弹出管理员确认，点“是”；在管理员进程里还会再校验一遍签名。
+5. 装好后默认用当前方案启动 Claude。
+
+说明：
+
+- 已经装了的再装新版本就是升级，登录状态、对话和设置都保留。
+- **卸载**会删数据：卸载 MSIX 版 Claude 时，Windows 会把它在 `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\` 下的数据一起删掉（登录状态、Claude 实际读取的 `claude_desktop_config.json` 等），所以重新安装后要重新登录，MCP 服务器也要重新配置。管理器自己的方案和设置不受影响，之前在管理器里“停用”的 MCP 服务器也还存着。
+- 下载时如果遇到 Cloudflare 的“浏览器验证”，或者这条线路被拒绝（HTTP 403），可以换一条线路，或者点 **打开官网下载页** 用浏览器下载，再用 **从本地安装包安装…** 选中下载的文件（`.msix` 或官网的 `ClaudeSetup.exe` 都行；选 exe 会运行官方安装程序）。
+- 当前 Windows 账户**不是管理员**时没法用这种方式装：安装包里的服务需要管理员权限，而让别的管理员账户授权的话，Claude 会装进那个账户。请用官网的 `ClaudeSetup.exe`，它请求管理员权限时点“否”，会改装不带 Cowork 的版本。
+- 用官网安装程序装好后，管理器几秒内会自动发现，不用重开。
 
 ### 一键关闭：哪些进程会被结束
 
@@ -112,6 +132,9 @@ ClaudeDesktopManager.exe stop                          关闭：先正常退出�
 ClaudeDesktopManager.exe kill                          立即结束全部进程
 ClaudeDesktopManager.exe status                        显示状态
 ClaudeDesktopManager.exe restore-tz                    恢复被临时切换的系统时区
+ClaudeDesktopManager.exe install [--proxy 地址 | --direct] [--dir 文件夹] [--start]
+                                                       下载最新版并安装（默认按当前方案的代理下载，存到“下载”文件夹）
+ClaudeDesktopManager.exe install --file 安装包 [--start] 用本地的 .msix / .exe 安装
 ClaudeDesktopManager.exe --tray                        只在托盘里运行
 ```
 
@@ -133,14 +156,15 @@ ClaudeDesktopManager.exe --tray                        只在托盘里运行
 
 ```
 desktop-manager/
-  src/Core/       与平台无关的逻辑：方案和设置、启动参数、进程识别和结束顺序、启动 / 关闭 / 时区 / 策略流程、
-                  JSON（保留键顺序）、MCP 配置、代理测试、日志和缓存
+  src/Core/       与平台无关的逻辑：方案和设置、启动参数、进程识别和结束顺序、启动 / 关闭 / 时区 / 策略 / 安装流程、
+                  JSON（保留键顺序）、MCP 配置、代理测试和下载（走代理、断点续传）、安装包检查、日志和缓存
   src/Platform/   Windows 实现（Toolhelp32、NtQueryInformationProcess、MSIX 激活、tzutil、注册表、服务）和自检
   src/UI/         WinForms 界面
   tests/          单元测试（在任何系统上都能跑：dotnet run -c Release --project desktop-manager/tests）、
-                  e2e.ps1（Windows 上用假的 Claude.exe 做端到端测试）
+                  e2e.ps1（Windows 上用假的 Claude.exe 做端到端测试）、
+                  real-claude.ps1（下载安装真的 Claude Desktop，再启动、关闭）
 ```
 
 命令行加 `--trace` 会打印检测安装、扫描进程、启动、等待各用了多少毫秒。
 
-CI（`.github/workflows/desktop-manager.yml`）在 Linux 和 Windows 上跑单元测试；在 Windows 上还会运行 `ClaudeDesktopManager.exe selftest` 检查各项 Windows 调用，用一个假的 Claude.exe 走一遍“启动 → 状态 → 关闭 → 启动 → 强制结束”，检查参数、环境变量、时区切换和恢复、哪些进程被结束或保留，并截取每一页的截图。在 Actions 页面手动运行这个工作流并勾选 `commit_screenshots`，会把这些截图提交到 `desktop-manager/docs/`（README 里的图就是这样来的）。
+CI（`.github/workflows/desktop-manager.yml`）在 Linux 和 Windows 上跑单元测试；在 Windows 上还会运行 `ClaudeDesktopManager.exe selftest` 检查各项 Windows 调用，用一个假的 Claude.exe 走一遍“启动 → 状态 → 关闭 → 启动 → 强制结束”，检查参数、环境变量、时区切换和恢复、哪些进程被结束或保留，并截取每一页的截图。在 Actions 页面手动运行这个工作流并勾选 `commit_screenshots`，会把这些截图提交到 `desktop-manager/docs/`（README 里的图就是这样来的）；勾选 `real_claude` 会在一台干净的 Windows 上用 `install` 命令下载安装真的 Claude Desktop，然后用方案启动（检查启动参数确实传给了 MSIX 版）、关闭、再启动、强制结束。

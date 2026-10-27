@@ -29,7 +29,8 @@ namespace ClaudeDesktopManager
         readonly Timer clockTimer = new Timer { Interval = 1000 };
 
         Label statusDot, statusText, statusDetail, installLabel, tzBanner;
-        Button tzRestoreButton;
+        Button tzRestoreButton, installButton;
+        DateTime lastInstallProbe = DateTime.UtcNow;
         ComboBox profileCombo;
         Button manageButton, startButton, restartButton, stopButton, killButton;
         TabControl tabs;
@@ -116,7 +117,7 @@ namespace ClaudeDesktopManager
                     return v;
                 });
                 ShowView(view);
-                if (m.Install == null) m.Log(LogLevel.Warn, "没有找到 Claude Desktop 的安装位置；可以在“设置”里手动指定 Claude.exe");
+                if (m.Install == null) m.Log(LogLevel.Warn, "没有找到 Claude Desktop：点上方的“下载安装 Claude…”可以装上官方版本；装在别处的话，可以在“设置”里指定 Claude.exe");
                 else m.Log(LogLevel.Info, "检测到 Claude Desktop：" + m.Install.Summary);
             }
             catch (Exception e)
@@ -144,6 +145,10 @@ namespace ClaudeDesktopManager
             tzRestoreButton = Kit.Button("恢复", async (s, e) => await RunOp("正在恢复时区…", () => m.RestoreTimeZone()));
             tzRestoreButton.Margin = new Padding(Kit.S(3), 0, Kit.S(3), 0);
             tzRestoreButton.Visible = false;
+            installButton = Kit.Button("下载安装 Claude…", (s, e) => ShowInstallDialog());
+            installButton.Margin = new Padding(Kit.S(3), 0, Kit.S(3), 0);
+            installButton.ForeColor = Kit.AccentColor;
+            installButton.Visible = false;
 
             profileCombo = Kit.Combo(200);
             profileCombo.SelectedIndexChanged += (s, e) => OnProfileSelected();
@@ -156,11 +161,11 @@ namespace ClaudeDesktopManager
             stopButton = Kit.Button("关闭 Claude", async (s, e) => await RunOp("正在关闭 Claude…", () => m.Stop(force: false)));
             killButton = Kit.Button("强制结束全部进程", async (s, e) => await RunOp("正在结束全部进程…", () => m.Stop(force: true)));
             killButton.ForeColor = Kit.ErrColor;
-            actionControls.AddRange(new Control[] { startButton, restartButton, stopButton, killButton, tzRestoreButton });
+            actionControls.AddRange(new Control[] { startButton, restartButton, stopButton, killButton, tzRestoreButton, installButton });
 
             var spacer = new Label { AutoSize = false, Width = Kit.S(16), Height = 1 };
             // Fixed height whether or not the time zone banner is shown, so the buttons never move.
-            var infoRow = Kit.Row(installLabel, tzBanner, tzRestoreButton);
+            var infoRow = Kit.Row(installLabel, installButton, tzBanner, tzRestoreButton);
             infoRow.WrapContents = false;
             infoRow.MinimumSize = new Size(0, tzRestoreButton.PreferredSize.Height + Kit.S(6));
             var header = Kit.Stack(
@@ -198,6 +203,7 @@ namespace ClaudeDesktopManager
 
             var inst = m.Install;
             installLabel.Text = inst == null ? "未找到 Claude Desktop 安装" : "安装：" + inst.Summary;
+            installButton.Visible = inst == null;
             UpdateTzBanner();
             UpdateTray(v);
             UpdateProcessList(v);
@@ -239,13 +245,24 @@ namespace ClaudeDesktopManager
             refreshing = true;
             try
             {
+                // Not installed: look again now and then, in case the official installer was used meanwhile.
+                bool probe = m.Install == null && !m.Busy && (DateTime.UtcNow - lastInstallProbe).TotalSeconds >= 10;
+                if (probe) lastInstallProbe = DateTime.UtcNow;
+                bool found = false;
                 var v = await Task.Run(() =>
                 {
+                    if (probe) found = m.RefreshInstall(quiet: true) != null;
                     var view = m.Scan();
                     if (!m.Busy) m.OnTick(view);
                     return view;
                 });
-                if (!IsDisposed) ShowView(v);
+                if (IsDisposed) return;
+                if (found)
+                {
+                    m.Log(LogLevel.Ok, "检测到 Claude Desktop：" + m.Install.Summary);
+                    OnInstallKnown();
+                }
+                ShowView(v);
             }
             catch (Exception e)
             {
@@ -279,6 +296,12 @@ namespace ClaudeDesktopManager
         {
             var profile = Current;
             if (profile == null) return;
+            if (m.Install == null)
+            {
+                if (MessageBox.Show(this, "没有找到 Claude Desktop。要现在下载安装官方版本吗？", AppInfo.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                    ShowInstallDialog();
+                return;
+            }
             FlushEdits();
             var spec = m.Preview(profile);
             if (spec.Errors.Count > 0)
@@ -305,6 +328,21 @@ namespace ClaudeDesktopManager
             if (profile.Proxy.ViaPolicy && !P.IsDemo)
                 m.Log(LogLevel.Info, "如果需要修改官方代理策略，Windows 会弹出管理员确认");
             await RunOp(doRestart ? "正在重启 Claude…" : "正在启动 Claude…", () => m.Start(profile.Name, doRestart));
+        }
+
+        public void ShowInstallDialog()
+        {
+            if (busy) return;
+            FlushEdits();
+            bool installed;
+            using (var d = new InstallDialog(m))
+            {
+                d.ShowDialog(this);
+                installed = d.Installed;
+            }
+            if (!installed) return;
+            OnInstallKnown();
+            RefreshStatus();
         }
 
         async Task RunOp(string busyText, Func<OpResult> op)
@@ -672,7 +710,7 @@ namespace ClaudeDesktopManager
             base.OnFormClosed(e);
         }
 
-        /// <summary>Demo / CI: render every tab to PNG files and quit.</summary>
+        /// <summary>Demo / CI: render every tab, and the install dialog half-way through a download, to PNG files.</summary>
         public void SaveScreenshots(string dir)
         {
             Directory.CreateDirectory(dir);
@@ -680,11 +718,26 @@ namespace ClaudeDesktopManager
             {
                 tabs.SelectedIndex = i;
                 Application.DoEvents();
-                using (var bmp = new Bitmap(Width, Height))
-                {
-                    DrawToBitmap(bmp, new Rectangle(0, 0, Width, Height));
-                    bmp.Save(Path.Combine(dir, "tab" + i + ".png"), System.Drawing.Imaging.ImageFormat.Png);
-                }
+                Save(this, Path.Combine(dir, "tab" + i + ".png"));
+            }
+            using (var d = new InstallDialog(m))
+            {
+                d.StartPosition = FormStartPosition.Manual;
+                d.Location = new Point(Left + Kit.S(60), Top + Kit.S(60));
+                d.Show(this);
+                d.ShowSampleProgress();
+                Application.DoEvents();
+                Save(d, Path.Combine(dir, "install.png"));
+                d.Hide();
+            }
+        }
+
+        static void Save(Form f, string path)
+        {
+            using (var bmp = new Bitmap(f.Width, f.Height))
+            {
+                f.DrawToBitmap(bmp, new Rectangle(0, 0, f.Width, f.Height));
+                bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
             }
         }
     }

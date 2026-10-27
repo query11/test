@@ -13,7 +13,7 @@ namespace ClaudeDesktopManager
         CheckBox chkLogProxyOnly;
         TextBox logView;
         ListView usageList;
-        Button cleanButton, reregisterButton;
+        Button cleanButton, reregisterButton, localInstallButton;
 
         Control BuildMaintenanceTab()
         {
@@ -27,7 +27,9 @@ namespace ClaudeDesktopManager
             usageList.Height = Kit.S(160);
             cleanButton = Kit.Button("清理缓存…", async (s, e) => await CleanCaches());
             reregisterButton = Kit.Button("重新注册 MSIX 包…", async (s, e) => await Reregister());
-            actionControls.AddRange(new Control[] { cleanButton, reregisterButton });
+            localInstallButton = Kit.Button("从本地安装包安装…", async (s, e) => await InstallFromFile());
+            var downloadButton = Kit.Button("下载并安装最新版…", (s, e) => ShowInstallDialog());
+            actionControls.AddRange(new Control[] { cleanButton, reregisterButton, localInstallButton, downloadButton });
 
             return Kit.Page(
                 Kit.Group("文件夹",
@@ -43,6 +45,13 @@ namespace ClaudeDesktopManager
                     Kit.Row(Kit.Button("统计占用", async (s, e) => await MeasureUsage()), cleanButton),
                     usageList,
                     Kit.Note("“清理缓存”只删 Cache、Code Cache、GPUCache 这类可以重新生成的缓存，不会退出登录，也不碰对话、设置和 Cowork 的虚拟机文件（vm_bundles）。要先关闭 Claude。")),
+                Kit.Group("安装 / 更新 Claude Desktop",
+                    Kit.Row(
+                        downloadButton,
+                        localInstallButton,
+                        Kit.Button("打开官网下载页", (s, e) => P.OpenUri(ClaudeRelease.DownloadPage))),
+                    Kit.Note("从 claude.ai 下载官方 MSIX 安装包，可以走代理，断了能接着下；校验 Anthropic 的数字签名后安装（要管理员确认）。" +
+                        "已经装了的会升级到最新版，登录状态和设置都保留。用浏览器从官网下载的 .msix 或 ClaudeSetup.exe，可以用“从本地安装包安装”。")),
                 Kit.Group("修复",
                     Kit.Row(reregisterButton, Kit.Button("复制诊断信息", async (s, e) => await CopyDiagnostics())),
                     Kit.Note("Claude 提示“Relaunch to update”却一直更新不上，或者开始菜单里点了打不开时，可以先关闭 Claude，再点“重新注册 MSIX 包”：" +
@@ -180,6 +189,35 @@ namespace ClaudeDesktopManager
                 return r;
             });
             OnInstallKnown();
+        }
+
+        async Task InstallFromFile()
+        {
+            string file;
+            using (var d = new OpenFileDialog
+            {
+                Title = "选择 Claude Desktop 安装包",
+                Filter = "Claude 安装包（*.msix; *.msixbundle; *.exe）|*.msix;*.msixbundle;*.appx;*.appxbundle;*.exe|所有文件|*.*",
+                InitialDirectory = Directory.Exists(P.DownloadsDir) ? P.DownloadsDir : "",
+            })
+            {
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+                file = d.FileName;
+            }
+            if (ClaudeRelease.IsPackageFile(file) && P.GetInstallRights() == InstallRights.StandardUser)
+            {
+                MessageBox.Show(this, Manager.StandardUserNote, AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (lastView != null && lastView.Targets.Count > 0 &&
+                MessageBox.Show(this, "安装前要先关闭正在运行的 Claude，现在关闭并安装吗？", AppInfo.Name, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+                return;
+            bool wasInstalled = m.Install != null;
+            await RunOp("正在安装 Claude…", () => m.InstallClaude(file));
+            OnInstallKnown();
+            if (!wasInstalled && m.Install != null &&
+                MessageBox.Show(this, "Claude Desktop 装好了。现在用方案「" + Current.Name + "」启动吗？", AppInfo.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                await StartClicked(false);
         }
 
         async Task CopyDiagnostics()

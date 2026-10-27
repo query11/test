@@ -21,7 +21,57 @@ namespace ClaudeDesktopManager
         public static ProxyEndpoint From(ProxySettings p) =>
             p != null && p.Mode == ProxyMode.Manual ? new ProxyEndpoint { Scheme = p.Scheme, Host = p.Host.Trim(), Port = p.Port } : null;
 
+        /// <summary>The proxy Windows is set to use for HTTPS; null when there is none (or only a PAC script).</summary>
+        public static ProxyEndpoint FromSystem(SystemProxyInfo sys)
+        {
+            if (sys == null || !sys.Enabled || sys.Server.Length == 0) return null;
+            var entries = sys.Server.Split(';').Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
+            string pick = null, scheme = "http";
+            foreach (var pref in new[] { "https=", "http=", "socks=" })
+            {
+                var e = entries.FirstOrDefault(x => x.StartsWith(pref, StringComparison.OrdinalIgnoreCase));
+                if (e != null)
+                {
+                    pick = e.Substring(pref.Length);
+                    if (pref == "socks=") scheme = "socks4";
+                    break;
+                }
+            }
+            if (pick == null) pick = entries.FirstOrDefault(x => !x.Contains("="));
+            if (pick == null) return null;
+            if (pick.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) pick = pick.Substring(7);
+            int colon = pick.LastIndexOf(':');
+            if (colon <= 0 || !int.TryParse(pick.Substring(colon + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out var port)) return null;
+            return new ProxyEndpoint { Scheme = scheme, Host = pick.Substring(0, colon).Trim('[', ']'), Port = port };
+        }
+
+        /// <summary>"http://127.0.0.1:7890", "socks5://127.0.0.1:1080"; a bare host:port means HTTP.</summary>
+        public static ProxyEndpoint Parse(string text, out string error)
+        {
+            error = null;
+            var t = (text ?? "").Trim();
+            if (!t.Contains("://")) t = "http://" + t;
+            var m = System.Text.RegularExpressions.Regex.Match(t, @"^(?<scheme>[A-Za-z0-9]+)://(?<host>\[[0-9A-Fa-f:.]+\]|[^:/@\s\[\]]+):(?<port>\d{1,5})/?$");
+            if (!m.Success || !int.TryParse(m.Groups["port"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int port) || port < 1 || port > 65535)
+            {
+                error = "代理地址应该像 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080";
+                return null;
+            }
+            var scheme = m.Groups["scheme"].Value.ToLowerInvariant();
+            if (!ProxyLogic.Schemes.Contains(scheme))
+            {
+                error = "不支持的代理协议：" + scheme;
+                return null;
+            }
+            return new ProxyEndpoint { Scheme = scheme, Host = m.Groups["host"].Value.Trim('[', ']'), Port = port };
+        }
+
         public override string ToString() => Scheme + "://" + ProxyLogic.UrlHost(Host) + ":" + Port.ToString(CultureInfo.InvariantCulture);
+
+        public override bool Equals(object obj) =>
+            obj is ProxyEndpoint o && o.Scheme == Scheme && string.Equals(o.Host, Host, StringComparison.OrdinalIgnoreCase) && o.Port == Port;
+
+        public override int GetHashCode() => ToString().ToLowerInvariant().GetHashCode();
     }
 
     public sealed class FetchResult
@@ -74,9 +124,9 @@ namespace ClaudeDesktopManager
             2080, 2081, 20170, 20171, 20172, 8080, 8118, 8888, 8889, 3128, 9050, 9150, 6152, 6153, 12334, 33210, 33211,
         };
 
-        const string UserAgent = "ClaudeDesktopManager/" + AppInfo.Version;
+        internal const string UserAgent = "ClaudeDesktopManager/" + AppInfo.Version;
 
-        sealed class StageException : Exception
+        internal sealed class StageException : Exception
         {
             public readonly string Stage;
 
@@ -87,57 +137,33 @@ namespace ClaudeDesktopManager
         {
             var r = new FetchResult { Url = url };
             var sw = Stopwatch.StartNew();
-            string stage = proxy != null ? "连接代理" : "连接";
+            var c = new HttpConnection(proxy, timeoutMs);
             try
             {
-                var uri = new Uri(url);
-                bool tls = uri.Scheme == Uri.UriSchemeHttps;
-                string host = uri.IdnHost;
-                int port = uri.Port;
-                using (var client = new TcpClient())
+                using (c)
                 {
-                    Connect(client, proxy != null ? proxy.Host : host, proxy != null ? proxy.Port : port, timeoutMs);
-                    r.ConnectMs = sw.ElapsedMilliseconds;
-                    Stream s = client.GetStream();
-                    s.ReadTimeout = s.WriteTimeout = timeoutMs;
-                    if (proxy != null)
-                    {
-                        stage = "代理握手";
-                        s = OpenTunnel(s, proxy, host, port);
-                        r.TunnelMs = sw.ElapsedMilliseconds - r.ConnectMs;
-                    }
-                    if (tls)
-                    {
-                        stage = "TLS";
-                        long before = sw.ElapsedMilliseconds;
-                        var ssl = new SslStream(s, false);
-                        ssl.AuthenticateAsClient(host);
-                        s = ssl;
-                        r.TlsMs = sw.ElapsedMilliseconds - before;
-                    }
-                    stage = "HTTP";
-                    string hostHeader = uri.IsDefaultPort ? uri.Host : uri.Host + ":" + port.ToString(CultureInfo.InvariantCulture);
-                    var req = "GET " + uri.PathAndQuery + " HTTP/1.1\r\nHost: " + hostHeader + "\r\nUser-Agent: " + UserAgent
-                        + "\r\nAccept: */*\r\nConnection: close\r\n\r\n";
-                    var bytes = Encoding.ASCII.GetBytes(req);
-                    s.Write(bytes, 0, bytes.Length);
-                    s.Flush();
-                    var reader = new HttpReader(s);
-                    var head = reader.ReadHead();
-                    r.StatusLine = head.Count > 0 ? head[0] : "";
-                    r.Status = ParseStatus(r.StatusLine);
-                    if (r.Status == 0) throw new StageException("HTTP", "响应不是 HTTP：" + Fmt.Shorten(r.StatusLine, 80));
-                    r.Body = reader.ReadBody(head, maxBody);
+                    var uri = new Uri(url);
+                    c.Open(uri);
+                    var head = c.Get(uri);
+                    r.StatusLine = head.StatusLine;
+                    r.Status = head.Status;
+                    r.Body = c.ReadText(head, maxBody);
                     r.Ok = true;
                 }
             }
-            catch (StageException e) { r.Stage = e.Stage; r.Error = e.Message; }
-            catch (Exception e) { r.Stage = stage; r.Error = Explain(e); }
+            catch (Exception e)
+            {
+                r.Stage = e is StageException se ? se.Stage : c.Stage;
+                r.Error = Explain(e);
+            }
+            r.ConnectMs = c.ConnectMs;
+            r.TunnelMs = c.TunnelMs;
+            r.TlsMs = c.TlsMs;
             r.TotalMs = sw.ElapsedMilliseconds;
             return r;
         }
 
-        static string Explain(Exception e)
+        internal static string Explain(Exception e)
         {
             if (e is AggregateException ae && ae.InnerException != null) e = ae.InnerException;
             if (e is System.Security.Authentication.AuthenticationException)
@@ -359,6 +385,115 @@ namespace ClaudeDesktopManager
             return probe;
         }
 
+        /// <summary>One request over a fresh connection: TCP, then the proxy tunnel, then TLS.</summary>
+        internal sealed class HttpConnection : IDisposable
+        {
+            readonly ProxyEndpoint proxy;
+            readonly int timeoutMs;
+            readonly Stopwatch sw = Stopwatch.StartNew();
+            readonly TcpClient client = new TcpClient();
+            Stream stream;
+            HttpReader reader;
+
+            /// <summary>What was going on when something failed.</summary>
+            public string Stage;
+            public long ConnectMs, TunnelMs, TlsMs;
+
+            public HttpConnection(ProxyEndpoint proxy, int timeoutMs)
+            {
+                this.proxy = proxy;
+                this.timeoutMs = timeoutMs;
+                Stage = proxy != null ? "连接代理" : "连接";
+            }
+
+            public void Open(Uri uri)
+            {
+                string host = uri.IdnHost;
+                int port = uri.Port;
+                Connect(client, proxy != null ? proxy.Host : host, proxy != null ? proxy.Port : port, timeoutMs);
+                ConnectMs = sw.ElapsedMilliseconds;
+                stream = client.GetStream();
+                stream.ReadTimeout = stream.WriteTimeout = timeoutMs;
+                if (proxy != null)
+                {
+                    Stage = "代理握手";
+                    stream = OpenTunnel(stream, proxy, host, port);
+                    TunnelMs = sw.ElapsedMilliseconds - ConnectMs;
+                }
+                if (uri.Scheme == Uri.UriSchemeHttps)
+                {
+                    Stage = "TLS";
+                    long before = sw.ElapsedMilliseconds;
+                    var ssl = new SslStream(stream, false);
+                    ssl.AuthenticateAsClient(host);
+                    stream = ssl;
+                    TlsMs = sw.ElapsedMilliseconds - before;
+                }
+                Stage = "HTTP";
+            }
+
+            /// <summary>Sends a GET and reads the status line and headers.</summary>
+            public HttpHead Get(Uri uri, params string[] headers)
+            {
+                string hostHeader = uri.IsDefaultPort ? uri.Host : uri.Host + ":" + uri.Port.ToString(CultureInfo.InvariantCulture);
+                var req = new StringBuilder("GET " + uri.PathAndQuery + " HTTP/1.1\r\nHost: " + hostHeader + "\r\nUser-Agent: " + UserAgent + "\r\nAccept: */*\r\n");
+                foreach (var h in headers) req.Append(h).Append("\r\n");
+                req.Append("Connection: close\r\n\r\n");
+                var bytes = Encoding.ASCII.GetBytes(req.ToString());
+                stream.Write(bytes, 0, bytes.Length);
+                stream.Flush();
+                reader = new HttpReader(stream);
+                var head = new HttpHead(reader.ReadHead());
+                if (head.Status == 0) throw new StageException("HTTP", "响应不是 HTTP：" + Fmt.Shorten(head.StatusLine, 80));
+                return head;
+            }
+
+            public string ReadText(HttpHead head, int max) => reader.ReadBody(head, max);
+
+            /// <summary>Hands the body to <paramref name="sink"/> piece by piece; false when the connection ended before all of it came.</summary>
+            public bool CopyBody(HttpHead head, Action<byte[], int> sink) => reader.CopyBody(head, sink);
+
+            /// <summary>Makes a read blocked on this connection fail at once (cancelling from another thread).</summary>
+            public void Abort()
+            {
+                try { client.Close(); } catch (Exception) { }
+            }
+
+            public void Dispose()
+            {
+                try { stream?.Dispose(); } catch (Exception) { }
+                client.Close();
+            }
+        }
+
+        /// <summary>Status line and headers of a response.</summary>
+        internal sealed class HttpHead
+        {
+            public readonly List<string> Lines;
+
+            public HttpHead(List<string> lines) { Lines = lines; }
+
+            public string StatusLine => Lines.Count > 0 ? Lines[0] : "";
+
+            public int Status => ParseStatus(StatusLine);
+
+            public string Header(string name)
+            {
+                foreach (var h in Lines.Skip(1))
+                {
+                    int i = h.IndexOf(':');
+                    if (i > 0 && h.Substring(0, i).Trim().Equals(name, StringComparison.OrdinalIgnoreCase)) return h.Substring(i + 1).Trim();
+                }
+                return null;
+            }
+
+            /// <summary>-1 when not given.</summary>
+            public long ContentLength =>
+                long.TryParse(Header("Content-Length"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) && n >= 0 ? n : -1;
+
+            public bool Chunked => (Header("Transfer-Encoding") ?? "").IndexOf("chunked", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         /// <summary>Minimal HTTP/1.1 response reader (status line, headers, Content-Length or chunked body).</summary>
         sealed class HttpReader
         {
@@ -382,6 +517,19 @@ namespace ClaudeDesktopManager
                     if (len <= 0) return -1;
                 }
                 return buf[pos++];
+            }
+
+            /// <summary>Whatever is already buffered first, then straight from the stream.</summary>
+            int Read(byte[] dst, int count)
+            {
+                if (pos < len)
+                {
+                    int n = Math.Min(count, len - pos);
+                    Buffer.BlockCopy(buf, pos, dst, 0, n);
+                    pos += n;
+                    return n;
+                }
+                return s.Read(dst, 0, count);
             }
 
             string ReadLine(bool allowEof)
@@ -418,53 +566,66 @@ namespace ClaudeDesktopManager
                 return lines;
             }
 
-            static string Header(List<string> head, string name)
-            {
-                foreach (var h in head.Skip(1))
-                {
-                    int i = h.IndexOf(':');
-                    if (i > 0 && h.Substring(0, i).Trim().Equals(name, StringComparison.OrdinalIgnoreCase)) return h.Substring(i + 1).Trim();
-                }
-                return null;
-            }
-
-            public string ReadBody(List<string> head, int max)
+            /// <summary>The body as text, cut at <paramref name="max"/> bytes; a connection that breaks off just ends it.</summary>
+            public string ReadBody(HttpHead head, int max)
             {
                 var body = new MemoryStream();
-                var te = Header(head, "Transfer-Encoding");
-                if (te != null && te.IndexOf("chunked", StringComparison.OrdinalIgnoreCase) >= 0)
+                try
                 {
-                    while (body.Length < max)
+                    CopyBody(head, (b, n) =>
                     {
-                        var sizeLine = ReadLine(true);
-                        if (sizeLine == null) break;
-                        var hex = sizeLine.Split(';')[0].Trim();
-                        if (!int.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int size) || size == 0) break;
-                        for (int i = 0; i < size; i++)
-                        {
-                            int b = ReadByte();
-                            if (b < 0) return Decode(body);
-                            if (body.Length < max) body.WriteByte((byte)b);
-                        }
-                        ReadLine(true);
-                    }
-                    return Decode(body);
+                        body.Write(b, 0, (int)Math.Min(n, max - body.Length));
+                        if (body.Length >= max) throw new EnoughException();
+                    });
                 }
-                long remaining = long.MaxValue;
-                if (long.TryParse(Header(head, "Content-Length"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var cl)) remaining = cl;
-                while (remaining > 0 && body.Length < max)
-                {
-                    int b;
-                    try { b = ReadByte(); }
-                    catch (IOException) { break; }
-                    if (b < 0) break;
-                    body.WriteByte((byte)b);
-                    remaining--;
-                }
-                return Decode(body);
+                catch (EnoughException) { }
+                // Whatever arrived is still worth showing.
+                catch (IOException) { }
+                catch (StageException) { }
+                return Encoding.UTF8.GetString(body.ToArray());
             }
 
-            static string Decode(MemoryStream ms) => Encoding.UTF8.GetString(ms.ToArray());
+            sealed class EnoughException : Exception { }
+
+            public bool CopyBody(HttpHead head, Action<byte[], int> sink)
+            {
+                var chunk = new byte[64 * 1024];
+                if (head.Chunked)
+                {
+                    while (true)
+                    {
+                        var sizeLine = ReadLine(true);
+                        if (sizeLine == null) return false;
+                        var hex = sizeLine.Split(';')[0].Trim();
+                        if (!long.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out long size) || size < 0)
+                            throw new StageException("HTTP", "分块编码格式不对：" + Fmt.Shorten(sizeLine, 40));
+                        if (size == 0) return true;
+                        if (!CopyExactly(size, chunk, sink)) return false;
+                        ReadLine(true);
+                    }
+                }
+                long length = head.ContentLength;
+                if (length >= 0) return CopyExactly(length, chunk, sink);
+                // Neither: the body runs until the server closes the connection.
+                while (true)
+                {
+                    int n = Read(chunk, chunk.Length);
+                    if (n <= 0) return true;
+                    sink(chunk, n);
+                }
+            }
+
+            bool CopyExactly(long count, byte[] chunk, Action<byte[], int> sink)
+            {
+                while (count > 0)
+                {
+                    int n = Read(chunk, (int)Math.Min(chunk.Length, count));
+                    if (n <= 0) return false;
+                    count -= n;
+                    sink(chunk, n);
+                }
+                return true;
+            }
         }
     }
 }

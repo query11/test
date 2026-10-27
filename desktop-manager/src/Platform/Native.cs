@@ -144,6 +144,27 @@ namespace ClaudeDesktopManager
         public static extern bool CreateProcessW(string lpApplicationName, StringBuilder lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes,
             bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFOW lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
 
+        public const ushort IMAGE_FILE_MACHINE_I386 = 0x014C;
+        public const ushort IMAGE_FILE_MACHINE_ARM64 = 0xAA64;
+
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetCurrentProcess();
+
+        /// <summary>Windows 10 1709+; tells the real machine even inside x64 emulation on ARM64.</summary>
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool IsWow64Process2(IntPtr hProcess, out ushort processMachine, out ushort nativeMachine);
+
+        public const int TokenElevationType = 18;
+        public const int TokenElevationTypeLimited = 3;
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool GetTokenInformation(IntPtr tokenHandle, int tokenInformationClass, out int tokenInformation, int tokenInformationLength, out int returnLength);
+
+        public static readonly Guid FOLDERID_Downloads = new Guid("374DE290-123F-4565-9164-39C4925E467B");
+
+        [DllImport("shell32.dll")]
+        public static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid rfid, uint dwFlags, IntPtr hToken, out IntPtr ppszPath);
+
         [DllImport("shell32.dll", SetLastError = true)]
         public static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string appID);
 

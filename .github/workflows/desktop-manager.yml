@@ -15,6 +15,10 @@ on:
         description: 'Commit the screenshots (demo data) to desktop-manager/docs/ on this branch'
         type: boolean
         default: false
+      real_claude:
+        description: 'Download and install the real Claude Desktop on a Windows runner, then start and stop it'
+        type: boolean
+        default: false
 
 jobs:
   linux:
@@ -99,3 +103,21 @@ jobs:
           if git diff --cached --quiet; then echo 'screenshots unchanged'; exit 0; fi
           git commit -m 'Update desktop-manager screenshots'
           git push
+
+  # Manual runs only: downloads the real installer and installs it on the runner.
+  real-claude:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.real_claude }}
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build
+        run: dotnet build -c Release desktop-manager/src
+      - name: Download, install, start and stop the real Claude Desktop
+        timeout-minutes: 30
+        # Windows PowerShell 5.1, where the Appx cmdlets (Get-AppxPackage) work natively.
+        shell: powershell
+        run: ./desktop-manager/tests/real-claude.ps1 -Manager (Resolve-Path desktop-manager/src/bin/Release/net48/ClaudeDesktopManager.exe)

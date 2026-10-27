@@ -269,6 +269,10 @@ localStorage 里已经用到的键：`ctm-limits`、`ctm-extra`、`ctm-usage-his
   - Windows 上没法给单个程序换时区（ICU 在 Windows 上不看 `TZ`），所以是临时切系统时区（tzutil），Claude 退出后恢复；原时区先写进设置文件。CLI 和托盘里的实例共用设置文件，`SettingsStore.SyncState()` 每次刷新时同步这部分状态。
   - 代理三种方式：Chromium 启动参数、官方的 `egressProxyUrl` 策略（HKCU\SOFTWARE\Policies\Claude，普通用户写不了，用 `--elevated-policy` 以管理员身份启动自己写入 `HKU\<SID>`）、环境变量（只对 Squirrel 安装；MSIX 通过 `IApplicationActivationManager` 激活，只能带参数）。
 - CI 里的 Windows 截图：Actions 制品和日志下载地址（blob.core.windows.net）在 Claude 的云端环境里访问不了，所以手动运行工作流并勾选 `commit_screenshots`，由 CI 把截图提交到 `desktop-manager/docs/`，再 `git pull`。命令行的 `--trace` 打印各步耗时，e2e 用它（之前每条命令 13–23 秒，原因是检测安装时每次都调 `Get-AppxPackage`，已改成注册表里有包列表时不调）。
+- 下载安装（用户误删了 Claude 后要的：“可以下载claude desktop”）：`Core/Download.cs`（自己写的 HTTP 下载器，走和 Claude 一样的代理，跟随跳转，`.part` 文件 + Range 续传，中途断开自动重试，可取消）、`Core/Release.cs`（地址、文件名、MSIX 清单里的 Identity、发布者 ID、`Add-AppxPackage` 错误码说明、PowerShell 脚本）、`Manager.DownloadLatest / InstallClaude`、`UI/InstallDialog.cs`、命令行 `install`。
+  - 地址：`https://claude.ai/api/desktop/win32/{x64|arm64}/msix/latest/redirect` → 307 → `https://downloads.claude.ai/releases/win32/x64/<版本>/Claude-<hash>.msix`。官网页面上的 `…/setup/latest/redirect`（ClaudeSetup.exe）会被 Cloudflare 的浏览器验证挡住，所以用 MSIX 地址；遇到验证页（`cf-mitigated: challenge` 或 “Just a moment”）就提示用浏览器下载、再“从本地安装包安装”。
+  - 检查：清单的 Name 是 Claude，Publisher 的发布者 ID 是 `pzs8sxrjxfjjc` 或 O/CN 是 `Anthropic, PBC`；`Get-AuthenticodeSignature` 有效且签名者是 Anthropic；安装时在管理员进程里再查一遍。安装包里有 Cowork 服务，普通用户 `Add-AppxPackage` 会失败（0x80073D28），所以以管理员身份运行 PowerShell（脚本走 `-EncodedCommand`，不落地），标准用户账户直接提示用官网 ClaudeSetup.exe。
+  - Claude 的云端环境访问不了 `downloads.claude.ai`（出口策略 403），真实下载只能在 CI 上测：手动运行工作流并勾选 `real_claude`，跑 `tests/real-claude.ps1`（下载、安装、启动、关闭、强制结束）。
 - 没在真的 Claude Desktop 上验证过的（CI 上没有 Claude）：MSIX 激活时参数是否原样传到 Claude.exe（启动后会读主进程命令行检查并提示）、`egressProxyUrl` 在 claude.ai 登录的普通模式下是否生效（看 `main.log` 的 `[egress-proxy]`）、Claude 关窗口时是退出还是缩到托盘（“关闭”先发 WM_CLOSE，等不到就强制结束）。用户实际用过后按反馈调整。
 
 ## 新窗口的开场提示（可以直接粘贴）

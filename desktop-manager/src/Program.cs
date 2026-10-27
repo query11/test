@@ -31,7 +31,7 @@ namespace ClaudeDesktopManager
 
             IPlatform platform;
             string settingsPath;
-            if (demo) platform = DemoSetup.Create(out settingsPath);
+            if (demo) platform = DemoSetup.Create(out settingsPath, args.Contains("--demo-uninstalled"));
             else
             {
                 platform = new WindowsPlatform();
@@ -60,6 +60,7 @@ namespace ClaudeDesktopManager
                     form.Location = new System.Drawing.Point(0, 0);
                     form.Size = new System.Drawing.Size(w, h);
                 }
+                if (args.Contains("--install-dialog")) form.Shown += (s, e) => form.BeginInvoke(new Action(form.ShowInstallDialog));
                 var shots = ArgAfter(args, "--screenshot");
                 if (shots != null)
                 {
@@ -124,7 +125,7 @@ namespace ClaudeDesktopManager
             return false;
         }
 
-        static readonly string[] OptionsWithValue = { "--profile", "--tab", "--screenshot", "--out", "--size" };
+        static readonly string[] OptionsWithValue = { "--profile", "--tab", "--screenshot", "--out", "--size", "--file", "--proxy", "--dir" };
 
         static bool IsOptionValue(string[] args, string a)
         {
@@ -193,11 +194,7 @@ namespace ClaudeDesktopManager
                 case "restart":
                     m.RefreshInstall();
                     r = m.Start(name, restartIfRunning: command == "restart");
-                    // Someone has to put the time zone back once Claude quits: leave the manager in the tray.
-                    if (r.Ok && m.S.PendingTz != null && !m.P.IsDemo && !Program.GuiRunning())
-                    {
-                        try { System.Diagnostics.Process.Start(m.P.SelfExe, "--tray"); } catch (Exception) { }
-                    }
+                    if (r.Ok) KeepTrayForTimeZone(m);
                     break;
                 case "stop":
                     m.RefreshInstall();
@@ -210,6 +207,8 @@ namespace ClaudeDesktopManager
                 case "restore-tz":
                     r = m.RestoreTimeZone();
                     break;
+                case "install":
+                    return Install(m, name, args, print);
                 case "status":
                     return Status(m, print);
                 case "selftest":
@@ -225,6 +224,63 @@ namespace ClaudeDesktopManager
             }
             foreach (var line in r.Lines) print(line);
             return r.Ok ? 0 : 1;
+        }
+
+        /// <summary>Downloads (unless --file) and installs Claude Desktop, printing the log as it goes.</summary>
+        static int Install(Manager m, string profile, string[] args, Action<string> print)
+        {
+            m.Logged += e => print(e.Text);
+            var file = Program.ArgAfter(args, "--file");
+            bool downloaded = file == null;
+            if (downloaded)
+            {
+                ProxyEndpoint proxy;
+                var proxyArg = Program.ArgAfter(args, "--proxy");
+                if (args.Contains("--direct")) proxy = null;
+                else if (proxyArg != null)
+                {
+                    proxy = ProxyEndpoint.Parse(proxyArg, out var err);
+                    if (proxy == null)
+                    {
+                        print(err);
+                        return 2;
+                    }
+                }
+                else proxy = m.DownloadRoutes()[0].Proxy;
+                if (m.P.GetInstallRights() == InstallRights.StandardUser)
+                {
+                    print(Manager.StandardUserNote);
+                    return 1;
+                }
+                var dir = Program.ArgAfter(args, "--dir") ?? m.P.DownloadsDir;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                long lastAt = -10000;
+                int lastPercent = -10;
+                var d = m.DownloadLatest(proxy, Path.GetFullPath(dir), p =>
+                {
+                    // A line every 10 %, or every 10 seconds while the size is unknown.
+                    bool due = p.Percent >= 0 ? p.Percent >= lastPercent + 10 : sw.ElapsedMilliseconds - lastAt >= 10000;
+                    if (!due) return;
+                    lastPercent = p.Percent;
+                    lastAt = sw.ElapsedMilliseconds;
+                    print("  " + p.Describe());
+                }, CancellationToken.None);
+                if (!d.Ok) return 1;
+                file = d.FilePath;
+            }
+            var r = m.InstallClaude(Path.GetFullPath(file), downloaded);
+            if (!r.Ok) return 1;
+            if (!args.Contains("--start")) return 0;
+            var started = m.Start(profile, restartIfRunning: false);
+            if (started.Ok) KeepTrayForTimeZone(m);
+            return started.Ok ? 0 : 1;
+        }
+
+        /// <summary>Someone has to put the time zone back once Claude quits: leave the manager in the tray.</summary>
+        static void KeepTrayForTimeZone(Manager m)
+        {
+            if (m.S.PendingTz == null || m.P.IsDemo || Program.GuiRunning()) return;
+            try { System.Diagnostics.Process.Start(m.P.SelfExe, "--tray"); } catch (Exception) { }
         }
 
         static int Status(Manager m, Action<string> print)
@@ -256,13 +312,16 @@ namespace ClaudeDesktopManager
             print("  kill           立即结束 Claude 的全部进程");
             print("  status         显示状态");
             print("  restore-tz     恢复被临时切换的系统时区");
+            print("  install        下载并安装最新版 Claude Desktop（官方 MSIX，校验签名，要管理员确认）");
+            print("                 --file 安装包：用本地的 .msix/.exe；--proxy http://127.0.0.1:7890 或 --direct：指定下载线路；");
+            print("                 --dir 文件夹：安装包存哪（默认“下载”文件夹）；--start：装好后用方案启动");
         }
     }
 
     /// <summary>Fake data for --demo (screenshots on any OS).</summary>
     static class DemoSetup
     {
-        public static IPlatform Create(out string settingsPath)
+        public static IPlatform Create(out string settingsPath, bool uninstalled = false)
         {
             var dir = Path.Combine(Path.GetTempPath(), "cdm-demo");
             if (Directory.Exists(dir)) Directory.Delete(dir, true);
@@ -303,7 +362,14 @@ namespace ClaudeDesktopManager
                     DataDirCandidates = { data },
                 },
             };
-            d.SeedRunning("--proxy-server=http://127.0.0.1:7890 --proxy-bypass-list=<local> --lang=en-US");
+            if (uninstalled)
+            {
+                // Claude was removed: nothing installed, nothing running.
+                d.InstallList = new List<ClaudeInstall>();
+                d.Cowork = ServiceState.NotInstalled;
+                d.Procs.RemoveAll(p => p.Name == "cowork-svc.exe");
+            }
+            else d.SeedRunning("--proxy-server=http://127.0.0.1:7890 --proxy-bypass-list=<local> --lang=en-US");
             d.SystemTz = "Pacific Standard Time";
             d.UserPolicy[ProxyLogic.PolicyUrlKey] = "http://127.0.0.1:7890";
 
@@ -317,7 +383,7 @@ namespace ClaudeDesktopManager
                 Lang = "en-US",
             });
             s.SelectedProfile = "美国西部 · 代理";
-            s.PendingTz = new PendingTimeZone { OriginalId = "China Standard Time", AppliedId = "Pacific Standard Time", SetAtUtc = DateTime.UtcNow.AddMinutes(-12) };
+            if (!uninstalled) s.PendingTz = new PendingTimeZone { OriginalId = "China Standard Time", AppliedId = "Pacific Standard Time", SetAtUtc = DateTime.UtcNow.AddMinutes(-12) };
             s.PolicyWrittenByUs = true;
             s.McpStash.Set(KnownDirs.Normalize(Path.Combine(data, "claude_desktop_config.json")).ToLowerInvariant(),
                 new JsonObject().Set("sqlite", new JsonObject().Set("command", "uvx").Set("args", new List<object> { "mcp-server-sqlite", "--db-path", "C:\\data\\app.db" })));

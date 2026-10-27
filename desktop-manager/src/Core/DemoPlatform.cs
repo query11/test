@@ -17,6 +17,8 @@ namespace ClaudeDesktopManager
         public string LocalAppData { get; set; } = @"C:\Users\Demo\AppData\Local";
         public string RoamingAppData { get; set; } = @"C:\Users\Demo\AppData\Roaming";
         public string DesktopDir { get; set; } = @"C:\Users\Demo\Desktop";
+        public string DownloadsDir { get; set; } = @"C:\Users\Demo\Downloads";
+        public string NativeArch { get; set; } = "x64";
         public string SelfExe => @"C:\Tools\ClaudeDesktopManager.exe";
         public int SelfPid => 4242;
         public int SessionId => 1;
@@ -40,6 +42,15 @@ namespace ClaudeDesktopManager
         public bool FailLaunch;
         public readonly HashSet<string> Unkillable = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         public bool RunAtLogin;
+        public InstallRights Rights = InstallRights.Consent;
+        public SignatureInfo Signature = new SignatureInfo
+        {
+            Status = "Valid",
+            Subject = "CN=\"Anthropic, PBC\", O=\"Anthropic, PBC\", L=San Francisco, S=California, C=US",
+            Message = "签名已验证。",
+        };
+        /// <summary>What InstallPackage answers; null installs Claude.</summary>
+        public CommandResult InstallAnswer;
 
         int nextPid = 9000;
         long clock = DateTime.UtcNow.AddMinutes(-48).ToFileTimeUtc();
@@ -261,6 +272,23 @@ namespace ClaudeDesktopManager
         {
             Calls.Add("powershell " + script);
             return new CommandResult { ExitCode = 0, Output = "（演示模式，没有真的执行）" };
+        }
+
+        public InstallRights GetInstallRights() => Rights;
+
+        public SignatureInfo CheckSignature(string file)
+        {
+            Calls.Add("signature " + System.IO.Path.GetFileName(file));
+            return Signature;
+        }
+
+        public CommandResult InstallPackage(string file, int timeoutMs)
+        {
+            Calls.Add("install " + System.IO.Path.GetFileName(file));
+            if (InstallAnswer != null) return InstallAnswer;
+            // Back to the default: Claude from MSIX.
+            InstallList = null;
+            return new CommandResult { ExitCode = 0, Output = "OK" };
         }
 
         public static readonly List<TimeZoneEntry> Zones = new List<TimeZoneEntry>

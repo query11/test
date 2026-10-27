@@ -176,29 +176,6 @@ namespace ClaudeDesktopManager
                 : "main.log 最近的代理记录：\n" + string.Join("\n", egress.Skip(Math.Max(0, egress.Count - 4)).Select(l => Fmt.Shorten(l, 220)));
         }
 
-        static ProxyEndpoint FromSystem(SystemProxyInfo sys)
-        {
-            if (sys == null || !sys.Enabled || sys.Server.Length == 0) return null;
-            var entries = sys.Server.Split(';').Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
-            string pick = null, scheme = "http";
-            foreach (var pref in new[] { "https=", "http=", "socks=" })
-            {
-                var e = entries.FirstOrDefault(x => x.StartsWith(pref, StringComparison.OrdinalIgnoreCase));
-                if (e != null)
-                {
-                    pick = e.Substring(pref.Length);
-                    if (pref == "socks=") scheme = "socks4";
-                    break;
-                }
-            }
-            if (pick == null) pick = entries.FirstOrDefault(x => !x.Contains("="));
-            if (pick == null) return null;
-            if (pick.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) pick = pick.Substring(7);
-            int colon = pick.LastIndexOf(':');
-            if (colon <= 0 || !int.TryParse(pick.Substring(colon + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out var port)) return null;
-            return new ProxyEndpoint { Scheme = scheme, Host = pick.Substring(0, colon).Trim('[', ']'), Port = port };
-        }
-
         async Task TestNetwork(bool direct)
         {
             FlushEdits();
@@ -216,7 +193,7 @@ namespace ClaudeDesktopManager
             else if (x.Mode == ProxyMode.Pac) label = "直连（PAC 脚本要由 Claude 自己解析，这里没法模拟）";
             else
             {
-                ep = FromSystem(P.GetSystemProxy());
+                ep = ProxyEndpoint.FromSystem(P.GetSystemProxy());
                 label = ep == null ? "直连（没有设置系统代理）" : "系统代理 " + ep;
             }
             testButton.Enabled = testDirectButton.Enabled = false;
