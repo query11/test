@@ -244,3 +244,7 @@ node --test
 git show HEAD~1:claude-token-meter.user.js > /tmp/old.user.js
 CTM_SCRIPT=/tmp/old.user.js node --test
 ```
+
+## 地球天象仪
+
+仓库里另有一个独立的小项目 [`earth/`](earth/)：按真实时间计算太阳、月球位置和地球自转的 3D 地球，带星空、云层、大气散射、城市灯光、极光和日月食。用浏览器打开 `earth/index.html` 即可，说明见 [earth/README.md](earth/README.md)。它的天文计算也由 `node --test` 测试（`tests/earth-astro.test.js`）。
